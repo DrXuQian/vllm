@@ -49,6 +49,13 @@ from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
+from vllm.utils.kvfloat13 import (
+    decode_kvfloat13,
+    decode_kvfloat13_blocks_triton,
+    is_kvfloat13_kv_cache,
+    kvfloat13_packed_bytes_per_head,
+    reshape_and_cache_kvfloat13,
+)
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
@@ -69,6 +76,7 @@ class FlashAttentionBackend(AttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        "kfloat13",
     ]
 
     @staticmethod
@@ -140,6 +148,14 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
+        if is_kvfloat13_kv_cache(cache_dtype_str):
+            return (
+                2,
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                kvfloat13_packed_bytes_per_head(head_size),
+            )
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -183,6 +199,8 @@ class FlashAttentionBackend(AttentionBackend):
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
+            return True
+        if is_kvfloat13_kv_cache(kv_cache_dtype):
             return True
         if is_quantized_kv_cache(kv_cache_dtype):
             return flash_attn_supports_fp8()
@@ -670,6 +688,8 @@ class FlashAttentionImpl(AttentionImpl):
         self._dcp_dtype: torch.dtype | None = None
         if vllm_config is not None and self.dcp_world_size > 1:
             self._dcp_dtype = vllm_config.model_config.dtype
+        self._kvfloat13_shadow_kv: torch.Tensor | None = None
+        self._kvfloat13_shadow_seq_len = 0
 
     def forward(
         self,
@@ -738,7 +758,32 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         # For decoder and cross-attention, use KV cache as before
-        key_cache, value_cache = kv_cache.unbind(0)
+        block_table = attn_metadata.block_table
+
+        if (
+            is_kvfloat13_kv_cache(self.kv_cache_dtype)
+            and not attn_metadata.use_cascade
+            and self.dcp_world_size == 1
+            and block_table.shape[0] == 1
+        ):
+            return self._forward_kvfloat13_single_request(
+                layer=layer,
+                query=query,
+                key=key,
+                value=value,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                output=output,
+            )
+
+        if is_kvfloat13_kv_cache(self.kv_cache_dtype):
+            key_cache, value_cache, block_table = self._decode_kvfloat13_blocks(
+                kv_cache,
+                block_table,
+                attn_metadata.seq_lens,
+            )
+        else:
+            key_cache, value_cache = kv_cache.unbind(0)
 
         if is_quantized_kv_cache(self.kv_cache_dtype):
             # queries are quantized in the attention layer
@@ -753,7 +798,6 @@ class FlashAttentionImpl(AttentionImpl):
             seqused_k = attn_metadata.seq_lens
             max_seqlen_q = attn_metadata.max_query_len
             max_seqlen_k = attn_metadata.max_seq_len
-            block_table = attn_metadata.block_table
             scheduler_metadata = attn_metadata.scheduler_metadata
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
@@ -775,6 +819,7 @@ class FlashAttentionImpl(AttentionImpl):
                     value_cache,
                     output[:num_actual_tokens],
                     attn_metadata,
+                    block_table=block_table,
                     q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
@@ -827,7 +872,7 @@ class FlashAttentionImpl(AttentionImpl):
             alibi_slopes=self.alibi_slopes,
             sliding_window=self.sliding_window,
             logits_soft_cap=self.logits_soft_cap,
-            block_table=attn_metadata.block_table,
+            block_table=block_table,
             common_prefix_len=attn_metadata.common_prefix_len,
             max_num_splits=attn_metadata.max_num_splits,
             fa_version=self.vllm_flash_attn_version,
@@ -840,6 +885,205 @@ class FlashAttentionImpl(AttentionImpl):
         )
         return output
 
+    def _forward_kvfloat13_single_request(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        block_size = kv_cache.shape[2]
+        seq_len = attn_metadata.max_seq_len
+        start_pos = seq_len - num_actual_tokens
+        key_cache, value_cache = self._get_kvfloat13_shadow_cache(
+            key,
+            value,
+            kv_cache,
+            attn_metadata.block_table,
+            seq_len,
+            start_pos,
+            block_size,
+        )
+        cu_seqlens_q = attn_metadata.query_start_loc
+        seqused_k = attn_metadata.seq_lens
+        max_seqlen_q = attn_metadata.max_query_len
+        scheduler_metadata = attn_metadata.scheduler_metadata
+        descale_shape = (1, self.num_kv_heads)
+
+        q_descale = (
+            layer._q_scale.expand(descale_shape)
+            if self.supports_quant_query_input
+            else None
+        )
+        k_descale = layer._k_scale.expand(descale_shape)
+        v_descale = layer._v_scale.expand(descale_shape)
+        sliding_window_size = (
+            list(self.sliding_window) if self.sliding_window is not None else None
+        )
+
+        flash_attn_varlen_func(
+            q=query[:num_actual_tokens],
+            k=key_cache,
+            v=value_cache,
+            out=output[:num_actual_tokens],
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=seq_len,
+            softmax_scale=self.scale,
+            causal=attn_metadata.causal,
+            alibi_slopes=self.alibi_slopes,
+            window_size=sliding_window_size,
+            softcap=self.logits_soft_cap,
+            scheduler_metadata=scheduler_metadata,
+            fa_version=self.vllm_flash_attn_version,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            num_splits=attn_metadata.max_num_splits,
+            s_aux=self.sinks,
+        )
+        return output
+
+    def _get_kvfloat13_shadow_cache(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_len: int,
+        start_pos: int,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        shadow_kv = self._kvfloat13_shadow_kv
+        if (
+            shadow_kv is None
+            or shadow_kv.device != key.device
+            or shadow_kv.shape[1] < seq_len
+        ):
+            new_capacity = max(seq_len, 2 * (shadow_kv.shape[1] if shadow_kv is not None else 0), 256)
+            shadow_kv = torch.empty(
+                (2, new_capacity, self.num_kv_heads, self.head_size),
+                device=key.device,
+                dtype=torch.bfloat16,
+            )
+            self._kvfloat13_shadow_kv = shadow_kv
+            self._kvfloat13_shadow_seq_len = 0
+
+        if start_pos == 0:
+            shadow_kv[0, :seq_len].copy_(key)
+            shadow_kv[1, :seq_len].copy_(value)
+            self._kvfloat13_shadow_seq_len = seq_len
+        elif start_pos == self._kvfloat13_shadow_seq_len:
+            shadow_kv[0, start_pos:seq_len].copy_(key[: seq_len - start_pos])
+            shadow_kv[1, start_pos:seq_len].copy_(value[: seq_len - start_pos])
+            self._kvfloat13_shadow_seq_len = seq_len
+        else:
+            num_used_blocks = cdiv(seq_len, block_size)
+            used_block_ids = block_table[0, :num_used_blocks]
+            out_shape = (
+                2,
+                num_used_blocks,
+                block_size,
+                self.num_kv_heads,
+                self.head_size,
+            )
+            decoded_k_shape = (
+                num_used_blocks * block_size,
+                self.num_kv_heads,
+                self.head_size,
+            )
+            (decoded_kv,) = current_workspace_manager().get_simultaneous(
+                (out_shape, torch.bfloat16),
+            )
+            decoded_kv = decode_kvfloat13_blocks_triton(
+                kv_cache,
+                used_block_ids,
+                self.head_size,
+                out=decoded_kv,
+            )
+            shadow_kv[0, :seq_len].copy_(decoded_kv[0].reshape(decoded_k_shape)[:seq_len])
+            shadow_kv[1, :seq_len].copy_(decoded_kv[1].reshape(decoded_k_shape)[:seq_len])
+            self._kvfloat13_shadow_seq_len = seq_len
+
+        return shadow_kv[0, :seq_len], shadow_kv[1, :seq_len]
+
+    def _decode_kvfloat13_blocks(
+        self,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        block_size = kv_cache.shape[2]
+        if block_table.shape[0] == 1:
+            num_used_blocks = cdiv(int(seq_lens[0]), block_size)
+            used_block_ids = block_table[0, :num_used_blocks]
+            compact_key_cache, compact_value_cache = self._decode_kvfloat13_pair(
+                kv_cache,
+                used_block_ids,
+            )
+            compact_block_table = torch.zeros_like(block_table)
+            compact_block_table[0, :num_used_blocks] = torch.arange(
+                num_used_blocks,
+                device=block_table.device,
+                dtype=block_table.dtype,
+            )
+            return compact_key_cache, compact_value_cache, compact_block_table
+
+        block_positions = torch.arange(
+            block_table.shape[1],
+            device=block_table.device,
+            dtype=seq_lens.dtype,
+        )
+        num_blocks_per_seq = torch.div(
+            seq_lens + block_size - 1,
+            block_size,
+            rounding_mode="floor",
+        )
+        valid_mask = block_positions.unsqueeze(0) < num_blocks_per_seq.unsqueeze(1)
+        used_block_ids = torch.unique(block_table[valid_mask], sorted=True)
+
+        compact_key_cache, compact_value_cache = self._decode_kvfloat13_pair(
+            kv_cache,
+            used_block_ids,
+        )
+
+        compact_block_table = torch.zeros_like(block_table)
+        compact_block_table[valid_mask] = torch.searchsorted(
+            used_block_ids,
+            block_table[valid_mask].to(torch.long),
+        ).to(block_table.dtype)
+        return compact_key_cache, compact_value_cache, compact_block_table
+
+    def _decode_kvfloat13_pair(
+        self,
+        kv_cache: torch.Tensor,
+        used_block_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_used_blocks = int(used_block_ids.numel())
+        block_size = kv_cache.shape[2]
+        out_shape = (
+            2,
+            num_used_blocks,
+            block_size,
+            self.num_kv_heads,
+            self.head_size,
+        )
+        (decoded_kv,) = current_workspace_manager().get_simultaneous(
+            (out_shape, torch.bfloat16),
+        )
+        decoded_kv = decode_kvfloat13_blocks_triton(
+            kv_cache,
+            used_block_ids,
+            self.head_size,
+            out=decoded_kv,
+        )
+        return decoded_kv.unbind(0)
+
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,
@@ -851,6 +1095,15 @@ class FlashAttentionImpl(AttentionImpl):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
+            return
+
+        if is_kvfloat13_kv_cache(self.kv_cache_dtype):
+            reshape_and_cache_kvfloat13(
+                key,
+                value,
+                kv_cache,
+                slot_mapping,
+            )
             return
 
         key_cache, value_cache = kv_cache.unbind(0)
@@ -882,6 +1135,7 @@ class FlashAttentionImpl(AttentionImpl):
         value_cache: torch.Tensor,
         output: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
+        block_table: torch.Tensor | None = None,
         q_descale: torch.Tensor | None = None,
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
@@ -892,7 +1146,8 @@ class FlashAttentionImpl(AttentionImpl):
 
         cu_seqlens_q = attn_metadata.query_start_loc
         max_seqlen_q = attn_metadata.max_query_len
-        block_table = attn_metadata.block_table
+        if block_table is None:
+            block_table = attn_metadata.block_table
 
         query = query.contiguous()
         query_across_dcp = get_dcp_group().all_gather(query, dim=1)

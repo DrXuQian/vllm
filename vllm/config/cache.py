@@ -19,6 +19,7 @@ CacheDType = Literal[
     "auto",
     "float16",
     "bfloat16",
+    "kfloat13",
     "fp8",
     "fp8_e4m3",
     "fp8_e5m2",

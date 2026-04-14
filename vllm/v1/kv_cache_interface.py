@@ -17,6 +17,10 @@ from vllm.logger import init_logger
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
+from vllm.utils.kvfloat13 import (
+    is_kvfloat13_kv_cache,
+    kvfloat13_page_size_bytes,
+)
 from vllm.utils.torch_utils import get_dtype_size
 
 logger = init_logger(__name__)
@@ -116,6 +120,7 @@ class AttentionSpec(KVCacheSpec):
     head_size: int
     dtype: torch.dtype
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
+    cache_dtype_str: str | None = None
     page_size_padded: int | None = None
 
     @property
@@ -135,6 +140,12 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if is_kvfloat13_kv_cache(self.cache_dtype_str):
+            return kvfloat13_page_size_bytes(
+                self.block_size,
+                self.num_kv_heads,
+                self.head_size,
+            )
         return (
             2
             * self.block_size
@@ -217,6 +228,7 @@ class FullAttentionSpec(AttentionSpec):
             head_size_v=specs[0].head_size_v,
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
+            cache_dtype_str=specs[0].cache_dtype_str,
             page_size_padded=specs[0].page_size_padded,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
@@ -237,6 +249,13 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if is_kvfloat13_kv_cache(self.cache_dtype_str):
+            return kvfloat13_page_size_bytes(
+                self.block_size,
+                self.num_kv_heads,
+                self.head_size,
+                self.head_size_v,
+            )
         return (
             self.block_size
             * self.num_kv_heads
@@ -412,6 +431,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             sink_len=specs[0].sink_len,
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
+            cache_dtype_str=specs[0].cache_dtype_str,
             page_size_padded=specs[0].page_size_padded,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),

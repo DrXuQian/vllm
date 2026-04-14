@@ -31,6 +31,7 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
 )
+from vllm.utils.kvfloat13 import is_kvfloat13_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionType,
@@ -293,6 +294,16 @@ class Attention(nn.Module, AttentionLayerBase):
         # During model initialization, the default dtype is set as the model
         # weight and activation dtype.
         dtype = torch.get_default_dtype()
+        if is_kvfloat13_kv_cache(kv_cache_dtype):
+            if dtype != torch.bfloat16:
+                raise NotImplementedError(
+                    "KVFloat13 currently only supports BF16 model execution."
+                )
+            resolved_head_size_v = head_size if head_size_v is None else head_size_v
+            if resolved_head_size_v != head_size:
+                raise NotImplementedError(
+                    "KVFloat13 currently requires head_size_v == head_size."
+                )
         if attn_backend is None:
             self.attn_backend = get_attn_backend(
                 head_size,
@@ -306,6 +317,12 @@ class Attention(nn.Module, AttentionLayerBase):
             )
         else:
             self.attn_backend = attn_backend
+        if is_kvfloat13_kv_cache(kv_cache_dtype):
+            assert self.attn_backend is not None
+            if self.attn_backend.get_name() != "FLASH_ATTN":
+                raise NotImplementedError(
+                    "KVFloat13 is only wired up for the FLASH_ATTN backend."
+                )
         backend_supports_alibi_sqrt = self.attn_backend.supports_alibi_sqrt()
         use_alibi_sqrt = use_alibi_sqrt if use_alibi_sqrt else False
         if use_alibi_sqrt and not backend_supports_alibi_sqrt:
@@ -542,6 +559,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size=self.head_size,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
+                cache_dtype_str=self.kv_cache_dtype,
                 sliding_window=self.sliding_window,
             )
         else:
@@ -552,6 +570,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
+                cache_dtype_str=self.kv_cache_dtype,
             )
 
 

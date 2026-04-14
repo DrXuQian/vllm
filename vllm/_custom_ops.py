@@ -24,9 +24,22 @@ if TYPE_CHECKING:
         return lambda name: fn
 else:
     try:
-        from torch.library import register_fake
+        from torch.library import register_fake as _torch_register_fake
     except ImportError:
-        from torch.library import impl_abstract as register_fake
+        from torch.library import impl_abstract as _torch_register_fake
+
+    def register_fake(op_name):
+        def decorator(fn):
+            try:
+                return _torch_register_fake(op_name)(fn)
+            except (AttributeError, RuntimeError):
+                # The Python package in this worktree can be newer than the
+                # compiled extension available on the machine. In that case,
+                # some custom ops do not exist and fake registration must be
+                # skipped so the rest of the package can still import.
+                return fn
+
+        return decorator
 
 
 # scaled_fp4_quant functional + out variant for torch.compile buffer management

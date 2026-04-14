@@ -34,6 +34,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
     "float": torch.float,
+    "kfloat13": torch.uint8,
     "fp8": torch.uint8,
     "fp8_e4m3": torch.uint8,
     "fp8_e5m2": torch.uint8,
