@@ -9,6 +9,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from vllm.utils.kvfloat13_cache_update_loader import ensure_kvfloat13_cache_update_op
+from vllm.utils.kvfloat13_decode_loader import ensure_kvfloat13_decode_op
 
 KVFLOAT13_DTYPE_STR = "kfloat13"
 KVFLOAT13_CHUNK_SIZE = 128
@@ -606,6 +607,22 @@ def decode_kvfloat13_blocks_triton(
                 f"Provided output has shape/dtype {tuple(out.shape)}/{out.dtype}, "
                 f"expected {out_shape}/torch.bfloat16."
             )
+
+    if not (
+        hasattr(torch.ops, "_C_cache_ops")
+        and hasattr(torch.ops._C_cache_ops, "decode_kvfloat13_blocks")
+    ):
+        ensure_kvfloat13_decode_op()
+
+    if hasattr(torch.ops, "_C_cache_ops") and hasattr(
+        torch.ops._C_cache_ops, "decode_kvfloat13_blocks"
+    ):
+        torch.ops._C_cache_ops.decode_kvfloat13_blocks(
+            kv_cache,
+            used_block_ids,
+            out,
+        )
+        return out
 
     out_2d = out.view(-1, head_size)
     rows = out_2d.shape[0]

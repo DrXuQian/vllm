@@ -9,6 +9,7 @@ from vllm.utils.kvfloat13 import (
     DEFAULT_KVFLOAT13_DECOMPRESS_LUT,
     build_kvfloat13_row_major_layout,
     decode_kvfloat13,
+    decode_kvfloat13_blocks_triton,
     encode_kvfloat13,
     get_default_kvfloat13_luts,
     kvfloat13_page_size_bytes,
@@ -213,6 +214,64 @@ def test_kvfloat13_live_suffix_patch_matches_index_copy():
     assert torch.equal(
         value_cache.cpu().view(torch.uint16),
         ref_value_cache.cpu().view(torch.uint16),
+    )
+
+
+def test_decode_kvfloat13_blocks_matches_expected_tokens():
+    if not torch.cuda.is_available():
+        return
+
+    device = torch.device("cuda")
+    num_blocks = 3
+    block_size = 2
+    num_kv_heads = 2
+    head_size = 128
+    packed_head = kvfloat13_packed_bytes_per_head(head_size)
+
+    kv_cache = torch.zeros(
+        (2, num_blocks, block_size, num_kv_heads, packed_head),
+        device=device,
+        dtype=torch.uint8,
+    )
+    num_tokens = num_blocks * block_size
+    sign = torch.zeros((num_tokens, num_kv_heads, head_size), device=device, dtype=torch.uint16)
+    exp8 = torch.full((num_tokens, num_kv_heads, head_size), 124, device=device, dtype=torch.uint16)
+    mant7 = (
+        torch.arange(num_tokens * num_kv_heads * head_size, device=device, dtype=torch.int32)
+        .reshape(num_tokens, num_kv_heads, head_size)
+        % 128
+    ).to(torch.uint16)
+    key = _bf16_from_fields(sign, exp8, mant7)
+    value = _bf16_from_fields(sign, exp8, ((mant7.to(torch.int32) + 17) % 128).to(torch.uint16))
+    slot_mapping = torch.arange(num_tokens, device=device, dtype=torch.int64)
+
+    reshape_and_cache_kvfloat13(key, value, kv_cache, slot_mapping)
+
+    used_block_ids = torch.tensor([2, 0], device=device, dtype=torch.int64)
+    decoded = decode_kvfloat13_blocks_triton(kv_cache, used_block_ids, head_size=head_size)
+
+    expected_tokens = torch.cat(
+        (
+            key[used_block_ids[0] * block_size : (used_block_ids[0] + 1) * block_size],
+            key[used_block_ids[1] * block_size : (used_block_ids[1] + 1) * block_size],
+        ),
+        dim=0,
+    )
+    expected_values = torch.cat(
+        (
+            value[used_block_ids[0] * block_size : (used_block_ids[0] + 1) * block_size],
+            value[used_block_ids[1] * block_size : (used_block_ids[1] + 1) * block_size],
+        ),
+        dim=0,
+    )
+
+    assert torch.equal(
+        decoded[0].reshape(-1, num_kv_heads, head_size).view(torch.uint16).cpu(),
+        expected_tokens.view(torch.uint16).cpu(),
+    )
+    assert torch.equal(
+        decoded[1].reshape(-1, num_kv_heads, head_size).view(torch.uint16).cpu(),
+        expected_values.view(torch.uint16).cpu(),
     )
 
 
