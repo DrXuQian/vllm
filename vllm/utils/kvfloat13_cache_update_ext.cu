@@ -14,7 +14,7 @@ constexpr int kKVFloat13ChunkBytes =
     kKVFloat13SignBytes + kKVFloat13ExpHiBytes + kKVFloat13ChunkSize;
 constexpr int kWarpSize = 32;
 constexpr int kKVFloat13PackThreads = 16;
-constexpr int kKVFloat13MaxWarpsPerBlock = 8;
+constexpr int kKVFloat13MaxWarpsPerBlock = 4;
 
 __device__ __forceinline__ uint8_t kvfloat13_default_compress_exp8(
     const uint8_t exp8) {
