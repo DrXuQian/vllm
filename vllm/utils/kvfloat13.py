@@ -8,6 +8,8 @@ from functools import lru_cache
 import torch
 from vllm.triton_utils import tl, triton
 
+from vllm.utils.kvfloat13_cache_update_loader import ensure_kvfloat13_cache_update_op
+
 KVFLOAT13_DTYPE_STR = "kfloat13"
 KVFLOAT13_CHUNK_SIZE = 128
 KVFLOAT13_SIGN_BYTES = 16
@@ -51,6 +53,72 @@ def kvfloat13_page_size_bytes(
     )
 
 
+def build_kvfloat13_row_major_layout(
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    *,
+    block_positions: torch.Tensor | None = None,
+    compact_block_table: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if block_table.ndim != 2:
+        raise ValueError(f"Expected 2D block_table, got shape {tuple(block_table.shape)}.")
+    if seq_lens.ndim != 1:
+        raise ValueError(f"Expected 1D seq_lens, got shape {tuple(seq_lens.shape)}.")
+    if block_table.shape[0] != seq_lens.shape[0]:
+        raise ValueError(
+            "block_table batch dimension must match seq_lens; "
+            f"got {block_table.shape[0]} and {seq_lens.shape[0]}."
+        )
+
+    if compact_block_table is None:
+        compact_block_table = torch.zeros_like(block_table)
+    else:
+        if compact_block_table.shape != block_table.shape:
+            raise ValueError(
+                "compact_block_table shape must match block_table; "
+                f"got {tuple(compact_block_table.shape)} and {tuple(block_table.shape)}."
+            )
+        if compact_block_table.device != block_table.device:
+            raise ValueError(
+                "compact_block_table device must match block_table device; "
+                f"got {compact_block_table.device} and {block_table.device}."
+            )
+        if compact_block_table.dtype != block_table.dtype:
+            raise ValueError(
+                "compact_block_table dtype must match block_table dtype; "
+                f"got {compact_block_table.dtype} and {block_table.dtype}."
+            )
+        compact_block_table.zero_()
+    if block_table.numel() == 0:
+        return block_table.new_empty((0,)), compact_block_table
+
+    max_blocks = block_table.shape[1]
+    if block_positions is None or block_positions.shape[0] < max_blocks:
+        block_positions = torch.arange(
+            max_blocks,
+            device=block_table.device,
+            dtype=seq_lens.dtype,
+        )
+    else:
+        block_positions = block_positions[:max_blocks]
+
+    num_blocks_per_seq = torch.div(
+        seq_lens + block_size - 1,
+        block_size,
+        rounding_mode="floor",
+    )
+    valid_mask = block_positions.unsqueeze(0) < num_blocks_per_seq.unsqueeze(1)
+    used_block_ids = block_table[valid_mask]
+    if used_block_ids.numel() > 0:
+        compact_block_table[valid_mask] = torch.arange(
+            used_block_ids.numel(),
+            device=block_table.device,
+            dtype=block_table.dtype,
+        )
+    return used_block_ids, compact_block_table
+
+
 @lru_cache(maxsize=1)
 def _default_decompress_lut_cpu() -> torch.Tensor:
     return torch.tensor(DEFAULT_KVFLOAT13_DECOMPRESS_LUT, dtype=torch.uint8)
@@ -58,9 +126,14 @@ def _default_decompress_lut_cpu() -> torch.Tensor:
 
 @lru_cache(maxsize=1)
 def _default_compress_lut_cpu() -> torch.Tensor:
-    decompress_lut = _default_decompress_lut_cpu().to(torch.int16)
-    all_exp = torch.arange(256, dtype=torch.int16).unsqueeze(1)
-    nearest = (all_exp - decompress_lut.unsqueeze(0)).abs().argmin(dim=1)
+    # Match the validated KVFloat13 LUT construction: choose the supported
+    # exponent with the nearest floating-point magnitude, not the nearest
+    # exponent index. This is what makes sub-101 exponents collapse to exp=0.
+    decompress_lut = _default_decompress_lut_cpu().to(torch.float64)
+    supported_mag = torch.pow(2.0, decompress_lut - 127.0)
+    all_exp = torch.arange(256, dtype=torch.float64).unsqueeze(1)
+    all_mag = torch.pow(2.0, all_exp - 127.0)
+    nearest = (all_mag - supported_mag.unsqueeze(0)).abs().argmin(dim=1)
     return nearest.to(torch.uint8)
 
 
@@ -586,6 +659,23 @@ def reshape_and_cache_kvfloat13(
         return
 
     if key.is_cuda:
+        compress_lut, _ = get_default_kvfloat13_luts(key.device)
+        if not (
+            hasattr(torch.ops, "_C_cache_ops")
+            and hasattr(torch.ops._C_cache_ops, "reshape_and_cache_kvfloat13")
+        ):
+            ensure_kvfloat13_cache_update_op()
+        if hasattr(torch.ops, "_C_cache_ops") and hasattr(
+            torch.ops._C_cache_ops, "reshape_and_cache_kvfloat13"
+        ):
+            torch.ops._C_cache_ops.reshape_and_cache_kvfloat13(
+                key[:num_tokens],
+                value[:num_tokens],
+                kv_cache,
+                slot_mapping,
+                compress_lut,
+            )
+            return
         _reshape_and_cache_kvfloat13_triton(
             key[:num_tokens],
             value[:num_tokens],
