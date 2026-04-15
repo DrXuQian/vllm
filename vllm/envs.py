@@ -241,6 +241,7 @@ if TYPE_CHECKING:
     VLLM_USE_FBGEMM: bool = False
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
+    VLLM_KVFLOAT13_USE_LIVE_SUFFIX_PATCH_KERNEL: bool = True
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -1629,6 +1630,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Debug workspace allocations.
     # logging of workspace resize operations.
     "VLLM_DEBUG_WORKSPACE": lambda: bool(int(os.getenv("VLLM_DEBUG_WORKSPACE", "0"))),
+    # Enable the standalone CUDA kernel for patching live BF16 suffix tokens
+    # into row-major KVFloat13 decode buffers. Set to 0 to fall back to
+    # torch.index_copy_.
+    "VLLM_KVFLOAT13_USE_LIVE_SUFFIX_PATCH_KERNEL": lambda: bool(
+        int(os.getenv("VLLM_KVFLOAT13_USE_LIVE_SUFFIX_PATCH_KERNEL", "1"))
+    ),
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
