@@ -10,6 +10,9 @@ from vllm.triton_utils import tl, triton
 
 from vllm.utils.kvfloat13_cache_update_loader import ensure_kvfloat13_cache_update_op
 from vllm.utils.kvfloat13_decode_loader import ensure_kvfloat13_decode_op
+from vllm.utils.kvfloat13_row_major_loader import (
+    ensure_kvfloat13_row_major_layout_op,
+)
 
 KVFLOAT13_DTYPE_STR = "kfloat13"
 KVFLOAT13_CHUNK_SIZE = 128
@@ -58,10 +61,11 @@ def build_kvfloat13_row_major_layout(
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     block_size: int,
+    decode_only: bool = False,
     *,
     block_positions: torch.Tensor | None = None,
     compact_block_table: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     if block_table.ndim != 2:
         raise ValueError(f"Expected 2D block_table, got shape {tuple(block_table.shape)}.")
     if seq_lens.ndim != 1:
@@ -92,7 +96,36 @@ def build_kvfloat13_row_major_layout(
             )
         compact_block_table.zero_()
     if block_table.numel() == 0:
-        return block_table.new_empty((0,)), compact_block_table
+        compact_slots = (
+            torch.empty((0,), device=block_table.device, dtype=torch.long)
+            if decode_only
+            else None
+        )
+        return block_table.new_empty((0,)), compact_block_table, compact_slots
+
+    if block_table.is_cuda:
+        if not (
+            hasattr(torch.ops, "_C_cache_ops")
+            and hasattr(torch.ops._C_cache_ops, "build_kvfloat13_row_major_layout")
+        ):
+            ensure_kvfloat13_row_major_layout_op()
+        if hasattr(torch.ops, "_C_cache_ops") and hasattr(
+            torch.ops._C_cache_ops, "build_kvfloat13_row_major_layout"
+        ):
+            used_block_ids, compact_slots = (
+                torch.ops._C_cache_ops.build_kvfloat13_row_major_layout(
+                    block_table,
+                    seq_lens,
+                    block_size,
+                    decode_only,
+                    compact_block_table,
+                )
+            )
+            return (
+                used_block_ids,
+                compact_block_table,
+                compact_slots if decode_only else None,
+            )
 
     max_blocks = block_table.shape[1]
     if block_positions is None or block_positions.shape[0] < max_blocks:
@@ -117,7 +150,26 @@ def build_kvfloat13_row_major_layout(
             device=block_table.device,
             dtype=block_table.dtype,
         )
-    return used_block_ids, compact_block_table
+    compact_slots = None
+    if decode_only:
+        seq_lens_long = seq_lens.to(torch.long)
+        req_indices = torch.arange(
+            seq_lens.shape[0],
+            device=seq_lens.device,
+            dtype=torch.long,
+        )
+        live_pos = seq_lens_long - 1
+        local_block_idx = torch.div(
+            live_pos,
+            block_size,
+            rounding_mode="floor",
+        )
+        compact_rows = compact_block_table[
+            req_indices,
+            local_block_idx,
+        ].to(torch.long)
+        compact_slots = compact_rows * block_size + (live_pos % block_size)
+    return used_block_ids, compact_block_table, compact_slots
 
 
 @lru_cache(maxsize=1)

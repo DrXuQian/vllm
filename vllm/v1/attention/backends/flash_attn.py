@@ -961,6 +961,7 @@ class FlashAttentionImpl(AttentionImpl):
                 ):
                     used_block_ids = cached_decode["used_block_ids"]
                     compact_block_table = cached_decode["compact_block_table"]
+                    compact_slots = cached_decode["compact_slots"]
                     layout_generation = int(cached_decode["generation"])
                     cached_layout_hit = True
                 else:
@@ -973,10 +974,11 @@ class FlashAttentionImpl(AttentionImpl):
         if not cached_layout_hit:
             with _nvtx_range("fa.kvfloat13.row_major_layout"):
                 compact_block_table = self._get_kvfloat13_compact_block_table(block_table)
-                used_block_ids, compact_block_table = build_kvfloat13_row_major_layout(
+                used_block_ids, compact_block_table, compact_slots = build_kvfloat13_row_major_layout(
                     block_table,
                     seq_lens,
                     block_size,
+                    decode_only=is_decode_only,
                     block_positions=self._get_kvfloat13_block_positions(
                         block_table, seq_lens
                     ),
@@ -1003,6 +1005,7 @@ class FlashAttentionImpl(AttentionImpl):
                     "last_block_ids": block_table[req_indices, last_block_positions].clone(),
                     "used_block_ids": used_block_ids,
                     "compact_block_table": compact_block_table,
+                    "compact_slots": compact_slots,
                     "generation": layout_generation,
                 }
             else:
@@ -1624,7 +1627,7 @@ class FlashAttentionImpl(AttentionImpl):
             return compact_key_cache, compact_value_cache, compact_block_table
 
         if not self._enable_prefix_caching:
-            used_block_ids, compact_block_table = build_kvfloat13_row_major_layout(
+            used_block_ids, compact_block_table, _ = build_kvfloat13_row_major_layout(
                 block_table,
                 seq_lens,
                 block_size,

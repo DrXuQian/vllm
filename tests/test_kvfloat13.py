@@ -156,7 +156,7 @@ def test_build_kvfloat13_row_major_layout_preserves_row_major_order():
     )
     seq_lens = torch.tensor([8, 12, 4], dtype=torch.int32)
 
-    used_block_ids, compact_block_table = build_kvfloat13_row_major_layout(
+    used_block_ids, compact_block_table, compact_slots = build_kvfloat13_row_major_layout(
         block_table,
         seq_lens,
         block_size=4,
@@ -173,6 +173,51 @@ def test_build_kvfloat13_row_major_layout_preserves_row_major_order():
             ],
             dtype=torch.int32,
         ),
+    )
+    assert compact_slots is None
+
+
+def test_build_kvfloat13_row_major_layout_cuda_decode_only_matches_expected_slots():
+    if not torch.cuda.is_available():
+        return
+
+    device = torch.device("cuda")
+    block_table = torch.tensor(
+        [
+            [7, 9, 0, 0],
+            [3, 5, 11, 0],
+            [4, 0, 0, 0],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    seq_lens = torch.tensor([8, 12, 4], dtype=torch.int32, device=device)
+
+    used_block_ids, compact_block_table, compact_slots = build_kvfloat13_row_major_layout(
+        block_table,
+        seq_lens,
+        block_size=4,
+        decode_only=True,
+    )
+
+    assert torch.equal(
+        used_block_ids.cpu(),
+        torch.tensor([7, 9, 3, 5, 11, 4], dtype=torch.int32),
+    )
+    assert torch.equal(
+        compact_block_table.cpu(),
+        torch.tensor(
+            [
+                [0, 1, 0, 0],
+                [2, 3, 4, 0],
+                [5, 0, 0, 0],
+            ],
+            dtype=torch.int32,
+        ),
+    )
+    assert torch.equal(
+        compact_slots.cpu(),
+        torch.tensor([7, 19, 23], dtype=torch.int64),
     )
 
 
