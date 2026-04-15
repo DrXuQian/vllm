@@ -927,6 +927,7 @@ class FlashAttentionImpl(AttentionImpl):
         list[int],
         list[int],
         torch.Tensor | None,
+        torch.Tensor | None,
         int,
     ]:
         cache = getattr(attn_metadata, "_kvfloat13_row_major_cache", None)
@@ -938,6 +939,7 @@ class FlashAttentionImpl(AttentionImpl):
                 cache["num_blocks_list"],
                 cache["query_lens"],
                 cache["compact_slots"],
+                cache["prefill_slots"],
                 cache["generation"],
             )
 
@@ -1037,12 +1039,14 @@ class FlashAttentionImpl(AttentionImpl):
             seq_lens_list: list[int] = []
             num_blocks_list: list[int] = []
             query_lens: list[int] = []
+            prefill_slots = None
         else:
             seq_lens_list = [int(x) for x in seq_lens.tolist()]
             num_blocks_list = [cdiv(seq_len, block_size) for seq_len in seq_lens_list]
             query_lens = [
                 int(x) for x in torch.diff(attn_metadata.query_start_loc).tolist()
             ]
+            prefill_slots = None
 
         if is_decode_only and compact_slots is None:
             seq_lens_long = seq_lens.to(torch.long)
@@ -1062,6 +1066,41 @@ class FlashAttentionImpl(AttentionImpl):
                 local_block_idx,
             ].to(torch.long)
             compact_slots = compact_rows * block_size + (live_pos % block_size)
+        elif (
+            not is_decode_only
+            and not self._enable_prefix_caching
+            and query_lens
+            and all(
+                query_len == seq_len
+                for seq_len, query_len in zip(
+                    seq_lens_list, query_lens, strict=True
+                )
+            )
+        ):
+            seq_lens_long = seq_lens.to(torch.long)
+            seq_indices = torch.repeat_interleave(
+                torch.arange(
+                    seq_lens.shape[0],
+                    device=seq_lens.device,
+                    dtype=torch.long,
+                ),
+                seq_lens_long,
+            )
+            token_offsets = torch.repeat_interleave(
+                attn_metadata.query_start_loc[:-1].to(torch.long),
+                seq_lens_long,
+            )
+            token_pos = torch.arange(
+                int(seq_lens_long.sum().item()),
+                device=seq_lens.device,
+                dtype=torch.long,
+            )
+            local_pos = token_pos - token_offsets
+            compact_rows = compact_block_table[
+                seq_indices,
+                torch.div(local_pos, block_size, rounding_mode="floor"),
+            ].to(torch.long)
+            prefill_slots = compact_rows * block_size + (local_pos % block_size)
 
         cache = {
             "block_size": block_size,
@@ -1071,6 +1110,7 @@ class FlashAttentionImpl(AttentionImpl):
             "num_blocks_list": num_blocks_list,
             "query_lens": query_lens,
             "compact_slots": compact_slots,
+            "prefill_slots": prefill_slots,
             "generation": layout_generation,
         }
         setattr(attn_metadata, "_kvfloat13_row_major_cache", cache)
@@ -1081,6 +1121,7 @@ class FlashAttentionImpl(AttentionImpl):
             num_blocks_list,
             query_lens,
             compact_slots,
+            prefill_slots,
             layout_generation,
         )
 
@@ -1393,10 +1434,19 @@ class FlashAttentionImpl(AttentionImpl):
             num_blocks_list,
             query_lens,
             compact_slots,
+            prefill_slots,
             layout_generation,
         ) = self._get_kvfloat13_row_major_cache(
             attn_metadata,
             block_size,
+        )
+        full_live_prefill = (
+            compact_slots is None
+            and not self._enable_prefix_caching
+            and all(
+                query_len == seq_len
+                for seq_len, query_len in zip(seq_lens_list, query_lens, strict=True)
+            )
         )
         if compact_slots is not None and not self._enable_prefix_caching:
             with _nvtx_range("fa.kvfloat13.batched.shadow_or_decode"):
@@ -1405,6 +1455,12 @@ class FlashAttentionImpl(AttentionImpl):
                     used_block_ids,
                     layout_generation,
                 )
+        elif full_live_prefill:
+            shadow_kv = self._get_kvfloat13_batched_shadow_buffer(
+                kv_cache,
+                int(used_block_ids.numel()),
+            )
+            key_cache, value_cache = shadow_kv[0], shadow_kv[1]
         else:
             with _nvtx_range("fa.kvfloat13.batched.decode_pair"):
                 key_cache, value_cache = self._decode_kvfloat13_pair(
@@ -1435,97 +1491,121 @@ class FlashAttentionImpl(AttentionImpl):
                     flat_value_cache.index_copy_(0, compact_slots, live_value)
         else:
             with _nvtx_range("fa.kvfloat13.batched.prefill_copy"):
-                block_cursor = 0
-                query_cursor = 0
-                for seq_len, num_blocks, query_len in zip(
-                    seq_lens_list, num_blocks_list, query_lens, strict=True
-                ):
-                    live_start = seq_len - query_len
-                    if query_len > 0:
-                        first_block = live_start // block_size
-                        last_block = (seq_len - 1) // block_size
-                        first_offset = live_start % block_size
-                        query_offset = 0
-
-                        if first_block == last_block:
-                            row = block_cursor + first_block
-                            end_offset = first_offset + query_len
-                            q_slice = slice(query_cursor, query_cursor + query_len)
-                            key_cache[row, first_offset:end_offset].copy_(key[q_slice])
-                            value_cache[row, first_offset:end_offset].copy_(value[q_slice])
-                        else:
-                            if first_offset != 0:
-                                first_len = block_size - first_offset
-                                row = block_cursor + first_block
-                                q_slice = slice(
-                                    query_cursor,
-                                    query_cursor + first_len,
-                                )
-                                key_cache[row, first_offset:].copy_(key[q_slice])
-                                value_cache[row, first_offset:].copy_(value[q_slice])
-                                query_offset += first_len
-                                full_block_start = first_block + 1
-                            else:
-                                full_block_start = first_block
-
-                            last_len = seq_len % block_size
-                            if last_len == 0:
-                                full_block_end = last_block + 1
-                            else:
-                                full_block_end = last_block
-
-                            num_full_blocks = full_block_end - full_block_start
-                            if num_full_blocks > 0:
-                                full_len = num_full_blocks * block_size
-                                q_slice = slice(
-                                    query_cursor + query_offset,
-                                    query_cursor + query_offset + full_len,
-                                )
-                                key_cache[
-                                    block_cursor
-                                    + full_block_start : block_cursor
-                                    + full_block_start
-                                    + num_full_blocks
-                                ].copy_(
-                                    key[q_slice].view(
-                                        num_full_blocks,
-                                        block_size,
-                                        self.num_kv_heads,
-                                        self.head_size,
-                                    )
-                                )
-                                value_cache[
-                                    block_cursor
-                                    + full_block_start : block_cursor
-                                    + full_block_start
-                                    + num_full_blocks
-                                ].copy_(
-                                    value[q_slice].view(
-                                        num_full_blocks,
-                                        block_size,
-                                        self.num_kv_heads,
-                                        self.head_size,
-                                    )
-                                )
-                                query_offset += full_len
-
-                            if last_len != 0:
-                                row = block_cursor + last_block
-                                q_slice = slice(
-                                    query_cursor + query_offset,
-                                    query_cursor + query_offset + last_len,
-                                )
-                                key_cache[row, :last_len].copy_(key[q_slice])
-                                value_cache[row, :last_len].copy_(value[q_slice])
-                    block_cursor += num_blocks
-                    query_cursor += query_len
-                if not self._enable_prefix_caching and attn_metadata.max_query_len > 1:
-                    self._set_kvfloat13_batched_shadow_cache(
-                        kv_cache,
-                        key_cache,
-                        value_cache,
-                        layout_generation,
+                if prefill_slots is not None:
+                    flat_key_cache = key_cache.view(-1, self.num_kv_heads, self.head_size)
+                    flat_value_cache = value_cache.view(
+                        -1,
+                        self.num_kv_heads,
+                        self.head_size,
                     )
+                    live_key = key[: attn_metadata.num_actual_tokens]
+                    live_value = value[: attn_metadata.num_actual_tokens]
+                    if self._kvfloat13_use_live_suffix_patch_kernel:
+                        ops.kvfloat13_live_suffix_patch(
+                            flat_key_cache,
+                            flat_value_cache,
+                            prefill_slots,
+                            live_key,
+                            live_value,
+                        )
+                    else:
+                        flat_key_cache.index_copy_(0, prefill_slots, live_key)
+                        flat_value_cache.index_copy_(0, prefill_slots, live_value)
+                else:
+                    block_cursor = 0
+                    query_cursor = 0
+                    for seq_len, num_blocks, query_len in zip(
+                        seq_lens_list, num_blocks_list, query_lens, strict=True
+                    ):
+                        live_start = seq_len - query_len
+                        if query_len > 0:
+                            first_block = live_start // block_size
+                            last_block = (seq_len - 1) // block_size
+                            first_offset = live_start % block_size
+                            query_offset = 0
+
+                            if first_block == last_block:
+                                row = block_cursor + first_block
+                                end_offset = first_offset + query_len
+                                q_slice = slice(query_cursor, query_cursor + query_len)
+                                key_cache[row, first_offset:end_offset].copy_(key[q_slice])
+                                value_cache[row, first_offset:end_offset].copy_(value[q_slice])
+                            else:
+                                if first_offset != 0:
+                                    first_len = block_size - first_offset
+                                    row = block_cursor + first_block
+                                    q_slice = slice(
+                                        query_cursor,
+                                        query_cursor + first_len,
+                                    )
+                                    key_cache[row, first_offset:].copy_(key[q_slice])
+                                    value_cache[row, first_offset:].copy_(value[q_slice])
+                                    query_offset += first_len
+                                    full_block_start = first_block + 1
+                                else:
+                                    full_block_start = first_block
+
+                                last_len = seq_len % block_size
+                                if last_len == 0:
+                                    full_block_end = last_block + 1
+                                else:
+                                    full_block_end = last_block
+
+                                num_full_blocks = full_block_end - full_block_start
+                                if num_full_blocks > 0:
+                                    full_len = num_full_blocks * block_size
+                                    q_slice = slice(
+                                        query_cursor + query_offset,
+                                        query_cursor + query_offset + full_len,
+                                    )
+                                    key_cache[
+                                        block_cursor
+                                        + full_block_start : block_cursor
+                                        + full_block_start
+                                        + num_full_blocks
+                                    ].copy_(
+                                        key[q_slice].view(
+                                            num_full_blocks,
+                                            block_size,
+                                            self.num_kv_heads,
+                                            self.head_size,
+                                        )
+                                    )
+                                    value_cache[
+                                        block_cursor
+                                        + full_block_start : block_cursor
+                                        + full_block_start
+                                        + num_full_blocks
+                                    ].copy_(
+                                        value[q_slice].view(
+                                            num_full_blocks,
+                                            block_size,
+                                            self.num_kv_heads,
+                                            self.head_size,
+                                        )
+                                    )
+                                    query_offset += full_len
+
+                                if last_len != 0:
+                                    row = block_cursor + last_block
+                                    q_slice = slice(
+                                        query_cursor + query_offset,
+                                        query_cursor + query_offset + last_len,
+                                    )
+                                    key_cache[row, :last_len].copy_(key[q_slice])
+                                    value_cache[row, :last_len].copy_(value[q_slice])
+                        block_cursor += num_blocks
+                        query_cursor += query_len
+                if not self._enable_prefix_caching and attn_metadata.max_query_len > 1:
+                    if full_live_prefill:
+                        self._kvfloat13_batched_shadow_generation = layout_generation
+                    else:
+                        self._set_kvfloat13_batched_shadow_cache(
+                            kv_cache,
+                            key_cache,
+                            value_cache,
+                            layout_generation,
+                        )
 
         cu_seqlens_q = attn_metadata.query_start_loc
         descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)

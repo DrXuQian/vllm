@@ -242,6 +242,7 @@ if TYPE_CHECKING:
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_KVFLOAT13_USE_LIVE_SUFFIX_PATCH_KERNEL: bool = True
+    VLLM_KVFLOAT13_USE_CACHE_UPDATE_KERNEL: bool = True
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -1635,6 +1636,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # torch.index_copy_.
     "VLLM_KVFLOAT13_USE_LIVE_SUFFIX_PATCH_KERNEL": lambda: bool(
         int(os.getenv("VLLM_KVFLOAT13_USE_LIVE_SUFFIX_PATCH_KERNEL", "1"))
+    ),
+    "VLLM_KVFLOAT13_USE_CACHE_UPDATE_KERNEL": lambda: bool(
+        int(os.getenv("VLLM_KVFLOAT13_USE_CACHE_UPDATE_KERNEL", "1"))
     ),
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(

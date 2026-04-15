@@ -629,6 +629,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "dst_scale, Tensor block_table, Tensor cu_seq_lens) -> ()");
   cache_ops.impl("cp_gather_indexer_k_quant_cache", torch::kCUDA,
                  &cp_gather_indexer_k_quant_cache);
+
+  cache_ops.def(
+      "kvfloat13_live_suffix_patch("
+      "Tensor! key_cache, Tensor! value_cache, Tensor slots, "
+      "Tensor key, Tensor value) -> ()");
+  cache_ops.impl("kvfloat13_live_suffix_patch", torch::kCUDA,
+                 &kvfloat13_live_suffix_patch);
 }
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cuda_utils), cuda_utils) {

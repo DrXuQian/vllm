@@ -2777,6 +2777,33 @@ def cp_gather_indexer_k_quant_cache(
     )
 
 
+def kvfloat13_live_suffix_patch(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slots: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> None:
+    from vllm.utils.kvfloat13_live_suffix_patch_loader import (
+        ensure_kvfloat13_live_suffix_patch_op,
+    )
+
+    if not (
+        hasattr(torch.ops, "_C_cache_ops")
+        and hasattr(torch.ops._C_cache_ops, "kvfloat13_live_suffix_patch")
+    ):
+        ensure_kvfloat13_live_suffix_patch_op()
+
+    if hasattr(torch.ops._C_cache_ops, "kvfloat13_live_suffix_patch"):
+        torch.ops._C_cache_ops.kvfloat13_live_suffix_patch(
+            key_cache, value_cache, slots, key, value
+        )
+        return
+
+    key_cache.index_copy_(0, slots, key)
+    value_cache.index_copy_(0, slots, value)
+
+
 def get_device_attribute(attribute: int, device: int) -> int:
     return torch.ops._C_cuda_utils.get_device_attribute(attribute, device)
 

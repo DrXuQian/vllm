@@ -91,3 +91,11 @@ void cp_gather_indexer_k_quant_cache(
     torch::Tensor& dst_scale,  // [num_tokens, head_dim / quant_block_size * 4]
     const torch::Tensor& block_table,   // [batch_size, num_blocks]
     const torch::Tensor& cu_seq_lens);  // [batch_size + 1]
+
+// Patch the live decode-step BF16 K/V back into compact row-major KV buffers.
+void kvfloat13_live_suffix_patch(
+    torch::Tensor& key_cache,       // [num_slots, num_kv_heads, head_size]
+    torch::Tensor& value_cache,     // [num_slots, num_kv_heads, head_size]
+    const torch::Tensor& slots,     // [num_live_tokens]
+    const torch::Tensor& key,       // [num_live_tokens, num_kv_heads, head_size]
+    const torch::Tensor& value);    // [num_live_tokens, num_kv_heads, head_size]
