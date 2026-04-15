@@ -7,7 +7,7 @@ from functools import lru_cache
 
 import torch
 from vllm.triton_utils import tl, triton
-
+from vllm import envs
 from vllm.utils.kvfloat13_cache_update_loader import ensure_kvfloat13_cache_update_op
 from vllm.utils.kvfloat13_decode_loader import ensure_kvfloat13_decode_op
 from vllm.utils.kvfloat13_row_major_loader import (
@@ -219,8 +219,8 @@ def _default_bf16_hi_lut_cpu() -> torch.Tensor:
 def get_default_kvfloat13_luts(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    compress = _default_compress_lut_cpu().to(device=device, non_blocking=True)
-    decompress = _default_decompress_lut_cpu().to(device=device, non_blocking=True)
+    compress = _default_compress_lut_cpu().to(device=device, non_blocking=False)
+    decompress = _default_decompress_lut_cpu().to(device=device, non_blocking=False)
     return compress, decompress
 
 
@@ -303,7 +303,6 @@ def _decode_kvfloat13_kernel(
 def _encode_kvfloat13_kernel(
     in_ptr,
     out_ptr,
-    compress_lut_ptr,
     in_row_stride: tl.int64,
     out_row_stride: tl.int64,
     CHUNK_BYTES: tl.constexpr,
@@ -324,7 +323,11 @@ def _encode_kvfloat13_kernel(
     sign = (vals >> 15) & 1
     exp8 = (vals >> 7) & 0xFF
     mant7 = vals & 0x7F
-    exp5 = tl.load(compress_lut_ptr + exp8).to(tl.uint16)
+    exp5 = tl.where(
+        exp8 <= 100,
+        0,
+        tl.where(exp8 >= 131, 31, exp8 - 100),
+    ).to(tl.uint16)
 
     out_base = out_ptr + row_idx * out_row_stride + chunk_idx * CHUNK_BYTES
 
@@ -416,7 +419,6 @@ def _reshape_and_cache_kvfloat13_kernel(
     value_ptr,
     kv_cache_ptr,
     slot_mapping_ptr,
-    compress_lut_ptr,
     stride_key_tok: tl.int64,
     stride_key_head: tl.int64,
     stride_val_tok: tl.int64,
@@ -462,7 +464,11 @@ def _reshape_and_cache_kvfloat13_kernel(
     sign = (vals >> 15) & 1
     exp8 = (vals >> 7) & 0xFF
     mant7 = vals & 0x7F
-    exp5 = tl.load(compress_lut_ptr + exp8).to(tl.uint16)
+    exp5 = tl.where(
+        exp8 <= 100,
+        0,
+        tl.where(exp8 >= 131, 31, exp8 - 100),
+    ).to(tl.uint16)
 
     out_base = (
         kv_cache_ptr
@@ -535,7 +541,6 @@ def encode_kvfloat13(
 
 
 def _encode_kvfloat13_triton(tensor: torch.Tensor) -> torch.Tensor:
-    compress_lut, _ = get_default_kvfloat13_luts(tensor.device)
     num_chunks = tensor.shape[-1] // KVFLOAT13_CHUNK_SIZE
     orig_shape = tensor.shape[:-1]
     tensor_2d = tensor.contiguous().reshape(-1, tensor.shape[-1])
@@ -548,7 +553,6 @@ def _encode_kvfloat13_triton(tensor: torch.Tensor) -> torch.Tensor:
     _encode_kvfloat13_kernel[grid](
         tensor_2d,
         out,
-        compress_lut,
         tensor_2d.stride(0),
         out.stride(0),
         CHUNK_BYTES=KVFLOAT13_CHUNK_BYTES,
@@ -575,7 +579,9 @@ def _decode_kvfloat13_torch(
         )
     use_default_tables = decompress_lut is None
     if use_default_tables:
-        _, decompress_lut = get_default_kvfloat13_luts(packed.device)
+        decompress_lut = _default_decompress_lut_cpu().to(
+            device=packed.device, dtype=torch.uint8
+        )
         bf16_hi_lut = _default_bf16_hi_lut(packed.device)
     else:
         decompress_lut = decompress_lut.to(device=packed.device, dtype=torch.uint8)
@@ -728,21 +734,19 @@ def reshape_and_cache_kvfloat13(
         return
 
     if key.is_cuda:
-        compress_lut, _ = get_default_kvfloat13_luts(key.device)
-        if not (
+        if envs.VLLM_KVFLOAT13_USE_CACHE_UPDATE_KERNEL and not (
             hasattr(torch.ops, "_C_cache_ops")
             and hasattr(torch.ops._C_cache_ops, "reshape_and_cache_kvfloat13")
         ):
             ensure_kvfloat13_cache_update_op()
-        if hasattr(torch.ops, "_C_cache_ops") and hasattr(
-            torch.ops._C_cache_ops, "reshape_and_cache_kvfloat13"
-        ):
+        if envs.VLLM_KVFLOAT13_USE_CACHE_UPDATE_KERNEL and hasattr(
+                torch.ops, "_C_cache_ops") and hasattr(
+                    torch.ops._C_cache_ops, "reshape_and_cache_kvfloat13"):
             torch.ops._C_cache_ops.reshape_and_cache_kvfloat13(
                 key[:num_tokens],
                 value[:num_tokens],
                 kv_cache,
                 slot_mapping,
-                compress_lut,
             )
             return
         _reshape_and_cache_kvfloat13_triton(
@@ -774,7 +778,6 @@ def _reshape_and_cache_kvfloat13_triton(
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
 ) -> None:
-    compress_lut, _ = get_default_kvfloat13_luts(key.device)
     num_tokens, num_heads, head_size = key.shape
     block_size = kv_cache.shape[2]
     groups_per_head = head_size // 8
@@ -784,7 +787,6 @@ def _reshape_and_cache_kvfloat13_triton(
         value,
         kv_cache,
         slot_mapping,
-        compress_lut,
         key.stride(0),
         key.stride(1),
         value.stride(0),

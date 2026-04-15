@@ -13,13 +13,25 @@ constexpr int kKVFloat13ExpHiBytes = 64;
 constexpr int kKVFloat13ChunkBytes =
     kKVFloat13SignBytes + kKVFloat13ExpHiBytes + kKVFloat13ChunkSize;
 
+__device__ __forceinline__ uint8_t kvfloat13_default_compress_exp8(
+    const uint8_t exp8) {
+  // Exact default mapping used by the validated CPU LUT:
+  // [0, 100] -> 0, [101, 131] -> 1..31, [132, 255] -> 31.
+  if (exp8 <= 100) {
+    return 0;
+  }
+  if (exp8 >= 131) {
+    return 31;
+  }
+  return static_cast<uint8_t>(exp8 - 100);
+}
+
 template <typename index_t>
 __global__ void reshape_and_cache_kvfloat13_bf16_kernel(
     const uint16_t* __restrict__ key,
     const uint16_t* __restrict__ value,
     uint8_t* __restrict__ kv_cache,
     const index_t* __restrict__ slot_mapping,
-    const uint8_t* __restrict__ compress_lut,
     const int64_t key_tok_stride,
     const int64_t key_head_stride,
     const int64_t value_tok_stride,
@@ -74,7 +86,7 @@ __global__ void reshape_and_cache_kvfloat13_bf16_kernel(
     const uint8_t sign = static_cast<uint8_t>(bits >> 15);
     const uint8_t exp8 = static_cast<uint8_t>((bits >> 7) & 0xFF);
     const uint8_t mant7 = static_cast<uint8_t>(bits & 0x7F);
-    const uint8_t exp5 = compress_lut[exp8];
+    const uint8_t exp5 = kvfloat13_default_compress_exp8(exp8);
     const uint8_t exp_hi4 = static_cast<uint8_t>(exp5 >> 1);
 
     sign_bits |= static_cast<uint8_t>(sign << i);
@@ -104,7 +116,6 @@ __global__ void reshape_and_cache_kvfloat13_bf16_kernel(
           reinterpret_cast<const uint16_t*>(value.data_ptr()),                  \
           reinterpret_cast<uint8_t*>(kv_cache.data_ptr()),                      \
           slot_mapping.data_ptr<INDEX_T>(),                                     \
-          compress_lut.data_ptr<uint8_t>(),                                     \
           key.stride(0),                                                        \
           key.stride(1),                                                        \
           value.stride(0),                                                      \
@@ -121,17 +132,14 @@ __global__ void reshape_and_cache_kvfloat13_bf16_kernel(
 void reshape_and_cache_kvfloat13(torch::Tensor key,
                                  torch::Tensor value,
                                  torch::Tensor kv_cache,
-                                 torch::Tensor slot_mapping,
-                                 torch::Tensor compress_lut) {
+                                 torch::Tensor slot_mapping) {
   TORCH_CHECK(key.is_cuda(), "key must be on CUDA");
   TORCH_CHECK(value.is_cuda(), "value must be on CUDA");
   TORCH_CHECK(kv_cache.is_cuda(), "kv_cache must be on CUDA");
   TORCH_CHECK(slot_mapping.is_cuda(), "slot_mapping must be on CUDA");
-  TORCH_CHECK(compress_lut.is_cuda(), "compress_lut must be on CUDA");
 
   TORCH_CHECK(key.device() == value.device() && key.device() == kv_cache.device() &&
-                  key.device() == slot_mapping.device() &&
-                  key.device() == compress_lut.device(),
+                  key.device() == slot_mapping.device(),
               "All tensors must be on the same device");
 
   TORCH_CHECK(key.scalar_type() == at::ScalarType::BFloat16,
@@ -140,8 +148,6 @@ void reshape_and_cache_kvfloat13(torch::Tensor key,
               "value must be bfloat16");
   TORCH_CHECK(kv_cache.scalar_type() == at::ScalarType::Byte,
               "kv_cache must be uint8");
-  TORCH_CHECK(compress_lut.scalar_type() == at::ScalarType::Byte,
-              "compress_lut must be uint8");
   TORCH_CHECK(slot_mapping.scalar_type() == at::ScalarType::Int ||
                   slot_mapping.scalar_type() == at::ScalarType::Long,
               "slot_mapping must be int32 or int64");
@@ -155,7 +161,6 @@ void reshape_and_cache_kvfloat13(torch::Tensor key,
   TORCH_CHECK(slot_mapping.dim() == 1, "slot_mapping must be 1D");
   TORCH_CHECK(slot_mapping.size(0) == key.size(0),
               "slot_mapping length must match key/value tokens");
-  TORCH_CHECK(compress_lut.numel() == 256, "compress_lut must have 256 entries");
   TORCH_CHECK(key.stride(2) == 1, "key last dimension must be contiguous");
   TORCH_CHECK(value.stride(2) == 1, "value last dimension must be contiguous");
   TORCH_CHECK(kv_cache.stride(4) == 1, "kv_cache packed dimension must be contiguous");
@@ -194,8 +199,7 @@ void reshape_and_cache_kvfloat13(torch::Tensor key,
 TORCH_LIBRARY_FRAGMENT(_C_cache_ops, m) {
   m.def(
       "reshape_and_cache_kvfloat13("
-      "Tensor key, Tensor value, Tensor! kv_cache, Tensor slot_mapping, "
-      "Tensor compress_lut) -> ()");
+      "Tensor key, Tensor value, Tensor! kv_cache, Tensor slot_mapping) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, m) {

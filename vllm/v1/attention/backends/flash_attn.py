@@ -718,6 +718,7 @@ class FlashAttentionImpl(AttentionImpl):
         self._kvfloat13_shadow_kv: torch.Tensor | None = None
         self._kvfloat13_shadow_seq_len = 0
         self._kvfloat13_decode_kv: torch.Tensor | None = None
+        self._kvfloat13_single_cu_seqlens_k: torch.Tensor | None = None
         self._kvfloat13_block_positions: torch.Tensor | None = None
         self._kvfloat13_compact_block_table: torch.Tensor | None = None
         self._kvfloat13_batched_shadow_kv: torch.Tensor | None = None
@@ -812,6 +813,27 @@ class FlashAttentionImpl(AttentionImpl):
             self.num_kv_heads,
             self.head_size,
         )
+
+    def _get_kvfloat13_single_cu_seqlens_k(
+        self,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        cu_seqlens_k = self._kvfloat13_single_cu_seqlens_k
+        if (
+            cu_seqlens_k is None
+            or cu_seqlens_k.device != query_start_loc.device
+            or cu_seqlens_k.dtype != query_start_loc.dtype
+        ):
+            cu_seqlens_k = torch.empty(
+                2,
+                device=query_start_loc.device,
+                dtype=query_start_loc.dtype,
+            )
+            self._kvfloat13_single_cu_seqlens_k = cu_seqlens_k
+        cu_seqlens_k[:1].copy_(query_start_loc[:1])
+        cu_seqlens_k[1:].copy_(seq_lens[:1])
+        return cu_seqlens_k
 
     def _get_kvfloat13_batched_shadow_buffer(
         self,
@@ -1309,7 +1331,10 @@ class FlashAttentionImpl(AttentionImpl):
                 key_cache[start_pos:seq_len].copy_(live_key)
                 value_cache[start_pos:seq_len].copy_(live_value)
         cu_seqlens_q = attn_metadata.query_start_loc
-        seqused_k = attn_metadata.seq_lens
+        cu_seqlens_k = self._get_kvfloat13_single_cu_seqlens_k(
+            cu_seqlens_q,
+            attn_metadata.seq_lens,
+        )
         max_seqlen_q = attn_metadata.max_query_len
         scheduler_metadata = attn_metadata.scheduler_metadata
         descale_shape = (1, self.num_kv_heads)
@@ -1332,7 +1357,7 @@ class FlashAttentionImpl(AttentionImpl):
                 v=value_cache,
                 out=output[:num_actual_tokens],
                 cu_seqlens_q=cu_seqlens_q,
-                seqused_k=seqused_k,
+                cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=seq_len,
                 softmax_scale=self.scale,
