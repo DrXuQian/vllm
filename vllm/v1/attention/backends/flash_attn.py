@@ -730,6 +730,7 @@ class FlashAttentionImpl(AttentionImpl):
         self._kvfloat13_graph_live_pos_buf: torch.Tensor | None = None
         self._kvfloat13_graph_block_idx_buf: torch.Tensor | None = None
         self._kvfloat13_graph_compact_slots: torch.Tensor | None = None
+        self._kvfloat13_graph_prev_block_ids: torch.Tensor | None = None
 
     def _can_use_kvfloat13_single_request_fast_path(
         self,
@@ -1580,6 +1581,10 @@ class FlashAttentionImpl(AttentionImpl):
         flat_block_ids = attn_metadata.block_table.reshape(-1)
 
         with _nvtx_range("fa.kvfloat13.graph_batched.decode"):
+            # Note: During CUDA graph capture/replay, we must use the
+            # full decode path (no data-dependent branching allowed).
+            # The graph_flat path is specifically for cudagraph mode,
+            # so always do full decode here.
             decode_kvfloat13_blocks_triton(
                 kv_cache,
                 flat_block_ids,
