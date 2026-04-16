@@ -725,6 +725,11 @@ class FlashAttentionImpl(AttentionImpl):
         self._kvfloat13_batched_shadow_generation = -1
         self._kvfloat13_row_major_decode_cache: dict[str, object] | None = None
         self._kvfloat13_row_major_generation = 0
+        self._kvfloat13_graph_dense_block_table: torch.Tensor | None = None
+        self._kvfloat13_graph_dense_base_slots: torch.Tensor | None = None
+        self._kvfloat13_graph_live_pos_buf: torch.Tensor | None = None
+        self._kvfloat13_graph_block_idx_buf: torch.Tensor | None = None
+        self._kvfloat13_graph_compact_slots: torch.Tensor | None = None
 
     def _can_use_kvfloat13_single_request_fast_path(
         self,
@@ -738,6 +743,25 @@ class FlashAttentionImpl(AttentionImpl):
         if attn_metadata.block_table.shape[0] != 1:
             return False
         return True
+
+    def _can_use_kvfloat13_batched_graph_flat_path(
+        self,
+        attn_metadata: FlashAttentionMetadata,
+    ) -> bool:
+        if not is_kvfloat13_kv_cache(self.kv_cache_dtype):
+            return False
+        if self._kvfloat13_allow_dynamic_shadow_growth:
+            return False
+        if attn_metadata.use_cascade:
+            return False
+        if self.dcp_world_size != 1:
+            return False
+        if attn_metadata.block_table.shape[0] <= 1:
+            return False
+        return (
+            attn_metadata.max_query_len == 1
+            and attn_metadata.num_actual_tokens == attn_metadata.seq_lens.shape[0]
+        )
 
     def _get_kvfloat13_block_positions(
         self,
@@ -858,6 +882,106 @@ class FlashAttentionImpl(AttentionImpl):
             )
             self._kvfloat13_batched_shadow_kv = shadow_kv
         return shadow_kv
+
+    def _get_kvfloat13_graph_dense_block_table(
+        self,
+        block_table: torch.Tensor,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, max_blocks = block_table.shape
+        dense_block_table = self._kvfloat13_graph_dense_block_table
+        if (
+            dense_block_table is None
+            or dense_block_table.device != block_table.device
+            or dense_block_table.dtype != block_table.dtype
+            or dense_block_table.shape[0] < batch_size
+            or dense_block_table.shape[1] < max_blocks
+        ):
+            dense_block_table = torch.arange(
+                batch_size * max_blocks,
+                device=block_table.device,
+                dtype=block_table.dtype,
+            ).view(batch_size, max_blocks)
+            self._kvfloat13_graph_dense_block_table = dense_block_table
+        dense_block_table = dense_block_table[:batch_size, :max_blocks]
+
+        base_slots = self._kvfloat13_graph_dense_base_slots
+        if (
+            base_slots is None
+            or base_slots.device != block_table.device
+            or base_slots.dtype != torch.long
+            or base_slots.shape[0] < batch_size
+        ):
+            base_slots = (
+                torch.arange(
+                    batch_size,
+                    device=block_table.device,
+                    dtype=torch.long,
+                )
+                * (max_blocks * block_size)
+            )
+            self._kvfloat13_graph_dense_base_slots = base_slots
+        return dense_block_table, base_slots[:batch_size]
+
+    def _get_kvfloat13_graph_compact_slots(
+        self,
+        seq_lens: torch.Tensor,
+        base_slots: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        batch_size = seq_lens.shape[0]
+        compact_slots = self._kvfloat13_graph_compact_slots
+        live_pos_buf = self._kvfloat13_graph_live_pos_buf
+        block_idx_buf = self._kvfloat13_graph_block_idx_buf
+        if (
+            compact_slots is None
+            or compact_slots.device != seq_lens.device
+            or compact_slots.dtype != torch.long
+            or compact_slots.shape[0] < batch_size
+        ):
+            compact_slots = torch.empty(
+                batch_size,
+                device=seq_lens.device,
+                dtype=torch.long,
+            )
+            self._kvfloat13_graph_compact_slots = compact_slots
+        if (
+            live_pos_buf is None
+            or live_pos_buf.device != seq_lens.device
+            or live_pos_buf.dtype != torch.long
+            or live_pos_buf.shape[0] < batch_size
+        ):
+            live_pos_buf = torch.empty(
+                batch_size,
+                device=seq_lens.device,
+                dtype=torch.long,
+            )
+            self._kvfloat13_graph_live_pos_buf = live_pos_buf
+        if (
+            block_idx_buf is None
+            or block_idx_buf.device != seq_lens.device
+            or block_idx_buf.dtype != torch.long
+            or block_idx_buf.shape[0] < batch_size
+        ):
+            block_idx_buf = torch.empty(
+                batch_size,
+                device=seq_lens.device,
+                dtype=torch.long,
+            )
+            self._kvfloat13_graph_block_idx_buf = block_idx_buf
+
+        compact_slots = compact_slots[:batch_size]
+        live_pos_buf = live_pos_buf[:batch_size]
+        block_idx_buf = block_idx_buf[:batch_size]
+        live_pos_buf.copy_(seq_lens)
+        live_pos_buf.sub_(1)
+        block_idx_buf.copy_(live_pos_buf)
+        block_idx_buf.floor_divide_(block_size)
+        compact_slots.copy_(base_slots)
+        compact_slots.add_(block_idx_buf, alpha=block_size)
+        live_pos_buf.remainder_(block_size)
+        compact_slots.add_(live_pos_buf)
+        return compact_slots
 
     def _try_get_kvfloat13_batched_shadow_cache(
         self,
@@ -1205,6 +1329,17 @@ class FlashAttentionImpl(AttentionImpl):
                 output=output,
             )
 
+        if self._can_use_kvfloat13_batched_graph_flat_path(attn_metadata):
+            return self._forward_kvfloat13_batched_graph_flat(
+                layer=layer,
+                query=query,
+                key=key,
+                value=value,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                output=output,
+            )
+
         if (
             is_kvfloat13_kv_cache(self.kv_cache_dtype)
             and not attn_metadata.use_cascade
@@ -1407,6 +1542,101 @@ class FlashAttentionImpl(AttentionImpl):
                 window_size=sliding_window_size,
                 softcap=self.logits_soft_cap,
                 scheduler_metadata=scheduler_metadata,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                num_splits=attn_metadata.max_num_splits,
+                s_aux=self.sinks,
+            )
+        return output
+
+    def _forward_kvfloat13_batched_graph_flat(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        block_size = kv_cache.shape[2]
+        batch_size, max_blocks = attn_metadata.block_table.shape
+        num_dense_blocks = batch_size * max_blocks
+        shadow_kv = self._get_kvfloat13_batched_shadow_buffer(
+            kv_cache,
+            num_dense_blocks,
+        )
+        dense_block_table, base_slots = self._get_kvfloat13_graph_dense_block_table(
+            attn_metadata.block_table,
+            block_size,
+        )
+        compact_slots = self._get_kvfloat13_graph_compact_slots(
+            attn_metadata.seq_lens,
+            base_slots,
+            block_size,
+        )
+        flat_block_ids = attn_metadata.block_table.reshape(-1)
+
+        with _nvtx_range("fa.kvfloat13.graph_batched.decode"):
+            decode_kvfloat13_blocks_triton(
+                kv_cache,
+                flat_block_ids,
+                self.head_size,
+                out=shadow_kv,
+            )
+
+        with _nvtx_range("fa.kvfloat13.graph_batched.live_suffix_patch"):
+            flat_key_cache = shadow_kv[0].view(-1, self.num_kv_heads, self.head_size)
+            flat_value_cache = shadow_kv[1].view(
+                -1,
+                self.num_kv_heads,
+                self.head_size,
+            )
+            live_key = key[: attn_metadata.num_actual_tokens]
+            live_value = value[: attn_metadata.num_actual_tokens]
+            if self._kvfloat13_use_live_suffix_patch_kernel:
+                ops.kvfloat13_live_suffix_patch(
+                    flat_key_cache,
+                    flat_value_cache,
+                    compact_slots,
+                    live_key,
+                    live_value,
+                )
+            else:
+                flat_key_cache.index_copy_(0, compact_slots, live_key)
+                flat_value_cache.index_copy_(0, compact_slots, live_value)
+
+        cu_seqlens_q = attn_metadata.query_start_loc
+        descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
+        q_descale = (
+            layer._q_scale.expand(descale_shape)
+            if self.supports_quant_query_input
+            else None
+        )
+        k_descale = layer._k_scale.expand(descale_shape)
+        v_descale = layer._v_scale.expand(descale_shape)
+        sliding_window_size = (
+            list(self.sliding_window) if self.sliding_window is not None else None
+        )
+        with _nvtx_range("fa.kvfloat13.graph_batched.flash_attn"):
+            flash_attn_varlen_func(
+                q=query[: attn_metadata.num_actual_tokens],
+                k=shadow_kv[0],
+                v=shadow_kv[1],
+                out=output[: attn_metadata.num_actual_tokens],
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=attn_metadata.max_query_len,
+                seqused_k=attn_metadata.seq_lens,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                block_table=dense_block_table,
+                softcap=self.logits_soft_cap,
+                scheduler_metadata=attn_metadata.scheduler_metadata,
                 fa_version=self.vllm_flash_attn_version,
                 q_descale=q_descale,
                 k_descale=k_descale,
