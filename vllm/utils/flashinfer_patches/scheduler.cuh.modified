@@ -171,7 +171,7 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     constexpr size_t smem_elem_sz = is_kvf13_sched ? sizeof(__nv_bfloat16) : sizeof(DTypeKV);
     const uint32_t smem_size =
         2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * smem_elem_sz +
-        std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*), 2 * bdy * bdz * sizeof(float));
+        std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*), 2 * bdy * bdz * sizeof(float)) + (is_kvf13_sched ? 256 : 0);
 
     auto kernel =
         BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,

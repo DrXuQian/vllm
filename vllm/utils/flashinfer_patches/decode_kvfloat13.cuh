@@ -1,25 +1,23 @@
 /*
- * KVFloat13 fused decode for FlashInfer's BatchDecodeWithPagedKVCache.
+ * KVFloat13 in-register decode for FlashInfer decode kernels.
  *
- * Replaces cp_async K/V loads with: ldg packed → decode in registers → sts BF16 to smem.
- * All compute (QK, softmax, V accumulate) remains unchanged.
- *
- * Usage: #define FLASHINFER_KVFLOAT13 before including decode.cuh,
- *        or call this function directly.
+ * Two-phase approach:
+ * Phase 1: cp_async load 208B packed chunk to staging smem (coalesced, async)
+ * Phase 2: decode from staging smem to BF16 in k_smem/v_smem (fast, parallel)
  */
 #ifndef FLASHINFER_DECODE_KVFLOAT13_CUH_
 #define FLASHINFER_DECODE_KVFLOAT13_CUH_
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include "../cp_async.cuh"
 
-// KVFloat13 layout constants
 #define KVF13_SIGN_OFF   0
 #define KVF13_EXP_HI_OFF 16
 #define KVF13_EM_OFF     80
 #define KVF13_CHUNK_BYTES 208
+#define KVF13_CP_ASYNC_LOADS 13  // 208 / 16
 
-// Decompress LUT — must be set by host before kernel launch
 __constant__ uint8_t d_kvf13_lut[32] = {
     0, 101, 102, 103, 104, 105, 106, 107,
     108, 109, 110, 111, 112, 113, 114, 115,
@@ -27,93 +25,70 @@ __constant__ uint8_t d_kvf13_lut[32] = {
     124, 125, 126, 127, 128, 129, 130, 131
 };
 
-/*!
- * \brief Load vec_size packed KVFloat13 values from global memory,
- *        decode to BF16 in registers, and store to shared memory.
- *
- * Replaces: cp_async::pred_load<vec_bits>(smem_dst, kv_data + offset, pred)
- *
- * \param smem_dst  Destination in shared memory (BF16)
- * \param kv_data   Global KV cache pointer (uint8_t, packed KVFloat13)
- * \param kv_offset Offset in ELEMENTS (not bytes) — same as original kv_offset
- *                  but scaled for packed format
- * \param pred      Whether this load is valid (in bounds)
- * \param tx        Thread x index (determines position within head_dim)
- * \param vec_size  Number of values per thread (typically 4)
- * \param head_dim  Original head dimension (128)
- */
-template <uint32_t vec_size>
-__device__ __forceinline__ void kvf13_load_decode_store(
-    __nv_bfloat16* smem_dst,  // destination in shared memory
-    const uint8_t* chunk,     // pointer to start of 208-byte chunk
-    uint32_t pos_in_head,     // position within head (tx * vec_size), 0-aligned
-    bool pred                 // validity predicate
+// Phase 1: cp_async 208B packed chunk → staging smem
+// 13 threads × 16B cp_async<128>. Thread >= 13 predicated off.
+__device__ __forceinline__ void kvf13_cp_async_to_staging(
+    uint8_t* staging_smem,
+    const uint8_t* global_chunk,
+    uint32_t tx,
+    bool valid
 ) {
-    if (!pred) {
-        // Zero fill
-        #pragma unroll
-        for (uint32_t i = 0; i < vec_size; ++i) {
-            smem_dst[i] = __float2bfloat16(0.0f);
-        }
-        return;
-    }
+    flashinfer::cp_async::pred_load<128, flashinfer::cp_async::PrefetchMode::kPrefetch, flashinfer::cp_async::SharedMemFillMode::kFillZero>(
+        staging_smem + tx * 16,
+        global_chunk + tx * 16,
+        valid && tx < KVF13_CP_ASYNC_LOADS
+    );
+}
 
-    // Load sign bits: vec_size bits starting at pos_in_head
-    // For vec_size=8: exactly 1 byte. For vec_size=4: half a byte.
-    const uint32_t sign_byte_idx = pos_in_head / 8;
-    const uint32_t sign_bit_off = pos_in_head & 7;
-
-    // Load exp_hi nibbles: vec_size/2 bytes
-    const uint32_t eh_byte_idx = pos_in_head / 2;
-
-    // Load exp_lo_mant: vec_size bytes
-    const uint32_t em_byte_idx = pos_in_head;
-
+// Phase 2: decode staged packed smem → BF16 smem
+template <uint32_t vec_size>
+__device__ __forceinline__ void kvf13_decode_staged(
+    __nv_bfloat16* bf16_dst,
+    const uint8_t* staging_src,
+    uint32_t pos_in_head
+) {
     #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
-        // Sign: 1 bit
-        uint32_t sign = (chunk[KVF13_SIGN_OFF + (pos_in_head + i) / 8] >> ((pos_in_head + i) & 7)) & 1u;
-
-        // Exp_hi: 1 nibble (4 bits)
-        uint32_t eh_byte = chunk[KVF13_EXP_HI_OFF + (pos_in_head + i) / 2];
-        uint32_t exp_h4 = ((pos_in_head + i) & 1) ? ((eh_byte >> 4) & 0xFu) : (eh_byte & 0xFu);
-
-        // Exp_lo + mantissa: 1 byte
-        uint32_t em_b = chunk[KVF13_EM_OFF + pos_in_head + i];
-
-        // Reconstruct
-        uint32_t exp5 = (exp_h4 << 1) | (em_b >> 7);
+        uint32_t pos = pos_in_head + i;
+        uint32_t sign = (staging_src[KVF13_SIGN_OFF + pos / 8] >> (pos & 7)) & 1u;
+        uint32_t eh = staging_src[KVF13_EXP_HI_OFF + pos / 2];
+        uint32_t exp_h4 = (pos & 1) ? ((eh >> 4) & 0xFu) : (eh & 0xFu);
+        uint32_t em = staging_src[KVF13_EM_OFF + pos];
+        uint32_t exp5 = (exp_h4 << 1) | (em >> 7);
         uint32_t exp8 = d_kvf13_lut[exp5];
-        uint32_t mant7 = em_b & 0x7Fu;
+        uint32_t mant7 = em & 0x7Fu;
         uint16_t bf16 = (uint16_t)((sign << 15) | (exp8 << 7) | mant7);
-        smem_dst[i] = *reinterpret_cast<__nv_bfloat16*>(&bf16);
+        bf16_dst[pos] = *reinterpret_cast<__nv_bfloat16*>(&bf16);
     }
 }
 
-/*!
- * \brief Compute the byte offset for a KVFloat13 packed chunk.
- *
- * For NHD layout: offset = page_idx * stride_page + entry_idx * stride_n + head_idx * stride_h
- * where strides are in BYTES (packed_bytes_per_head = 208, not head_dim = 128).
- *
- * \param page_idx   Physical page index
- * \param head_idx   KV head index
- * \param entry_idx  Entry within page (token position in page)
- * \param num_heads  Number of KV heads
- * \param page_size  Tokens per page
- * \return Byte offset from kv_data start
- */
-__device__ __forceinline__ size_t kvf13_get_chunk_offset(
-    uint32_t page_idx,
-    uint32_t head_idx,
-    uint32_t entry_idx,
-    uint32_t num_heads,
-    uint32_t page_size
+// Fallback: direct ldg load + decode (for SingleDecode / non-pipelined use)
+template <uint32_t vec_size>
+__device__ __forceinline__ void kvf13_load_decode_store(
+    __nv_bfloat16* smem_dst,
+    const uint8_t* chunk,
+    uint32_t pos_in_head,
+    bool pred
 ) {
-    // NHD: [num_pages, page_size, num_heads, 208]
-    return (size_t)page_idx * page_size * num_heads * KVF13_CHUNK_BYTES
-         + entry_idx * num_heads * KVF13_CHUNK_BYTES
-         + head_idx * KVF13_CHUNK_BYTES;
+    if (!pred) {
+        #pragma unroll
+        for (uint32_t i = 0; i < vec_size; ++i)
+            smem_dst[pos_in_head + i] = __float2bfloat16(0.0f);
+        return;
+    }
+    #pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+        uint32_t pos = pos_in_head + i;
+        uint32_t sign = (chunk[KVF13_SIGN_OFF + pos / 8] >> (pos & 7)) & 1u;
+        uint32_t eh = chunk[KVF13_EXP_HI_OFF + pos / 2];
+        uint32_t exp_h4 = (pos & 1) ? ((eh >> 4) & 0xFu) : (eh & 0xFu);
+        uint32_t em = chunk[KVF13_EM_OFF + pos];
+        uint32_t exp5 = (exp_h4 << 1) | (em >> 7);
+        uint32_t exp8 = d_kvf13_lut[exp5];
+        uint32_t mant7 = em & 0x7Fu;
+        uint16_t bf16 = (uint16_t)((sign << 15) | (exp8 << 7) | mant7);
+        smem_dst[pos] = *reinterpret_cast<__nv_bfloat16*>(&bf16);
+    }
 }
 
-#endif  // FLASHINFER_DECODE_KVFLOAT13_CUH_
+#endif
