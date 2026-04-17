@@ -615,9 +615,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.page_size = self.kv_cache_spec.block_size
 
         if is_kvfloat13_kv_cache(self.cache_config.cache_dtype):
-            # KVFloat13: storage is uint8, but attention operates on BF16 shadow
+            # KVFloat13: use BF16 dtype for FlashInfer wrappers.
+            # The native uint8 decode path is activated at runtime via
+            # stride-trick views in forward(), not via plan() dtype.
+            # This ensures mixed prefill+decode batches work correctly.
             self.cache_dtype = self.cache_config.cache_dtype
-            self.kv_cache_dtype = self.model_config.dtype  # BF16 for attention
+            self.kv_cache_dtype = self.model_config.dtype  # BF16 for all wrappers
         elif self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
             self.cache_dtype = self.cache_config.cache_dtype
             self.kv_cache_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
@@ -637,6 +640,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if (
             can_use_trtllm
             and not vllm_config.attention_config.disable_flashinfer_q_quantization
+            
         ):
             self.q_data_type = self.kv_cache_dtype
         else:
@@ -1053,7 +1057,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 window_left=self.window_left,
                 logits_soft_cap=self.logits_soft_cap,
                 q_data_type=self.q_data_type,
-                kv_data_type=self.kv_cache_dtype,
+                kv_data_type=getattr(self, '_kvfloat13_prefill_kv_dtype', self.kv_cache_dtype),
             )
             return attn_metadata
 
@@ -1453,18 +1457,15 @@ class FlashInferImpl(AttentionImpl):
             )
             kv_cache = kv_cache.view(torch_dtype)
 
-        # KVFloat13: save packed cache ref for fused decode kernel
+        # KVFloat13: decode packed cache → BF16 shadow for FlashInfer.
+        # Shadow decode is needed because FlashInfer's Python wrapper
+        # requires plan() and run() to use the same kv_data_type,
+        # and mixed prefill+decode batches need a unified dtype.
+        # The native uint8 decode path (modified decode.cuh) works at
+        # the CUDA level but requires separate plan() for decode-only batches.
         if self._is_kvfloat13:
             self._kvfloat13_packed_cache = kv_cache
-            # Skip shadow decode when ONLY decode tokens exist AND fused
-            # kernel is available (TRTLLMDecode has block_tables/seq_lens).
-            # Prefill or FIDecode paths still need BF16 shadow.
-            need_shadow = (
-                attn_metadata.num_prefill_tokens > 0
-                or not isinstance(attn_metadata.decode, TRTLLMDecode)
-            )
-            if need_shadow:
-                kv_cache = self._decode_kvfloat13_to_shadow(kv_cache, attn_metadata)
+            kv_cache = self._decode_kvfloat13_to_shadow(kv_cache, attn_metadata)
 
         # Inputs and outputs may be padded for CUDA graphs
         query = query[:num_actual_tokens]
@@ -1624,26 +1625,7 @@ class FlashInferImpl(AttentionImpl):
             decode_query = query[:num_decode_tokens]
             assert decode_query.shape[0] == num_decode_tokens
 
-            if self._is_kvfloat13 and isinstance(attn_metadata.decode, TRTLLMDecode):
-                # Fused KVFloat13 decode attention — reads packed KV
-                # directly from paged cache, no separate decode needed.
-                from vllm.utils.kvfloat13_fused_attn_loader import (
-                    kvfloat13_fused_decode_attn,
-                )
-                packed_cache = self._kvfloat13_packed_cache
-                kv_k = packed_cache[:, 0]  # [num_pages, page_size, heads, packed]
-                kv_v = packed_cache[:, 1]
-                fused_out = kvfloat13_fused_decode_attn(
-                    decode_query.contiguous().reshape(-1, self.num_heads, self.head_size),
-                    kv_k, kv_v,
-                    attn_metadata.decode.block_tables.to(torch.int32),
-                    attn_metadata.decode.seq_lens.to(torch.int32),
-                    self.scale,
-                    max_seq_len=attn_metadata.decode.max_seq_len,
-                )
-                output[:num_decode_tokens] = fused_out.reshape(num_decode_tokens, -1)
-
-            elif not decode_use_trtllm:
+            if not decode_use_trtllm:
                 assert isinstance(attn_metadata.decode, FIDecode)
                 decode_wrapper = attn_metadata.decode.wrapper
                 assert decode_wrapper is not None
