@@ -29,6 +29,7 @@
 #include "../exception.h"
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
+#include "decode_kvfloat13.cuh"
 #include "heap.h"
 
 namespace flashinfer {
@@ -37,6 +38,12 @@ template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t 
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
           typename Params>
 __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params params);
+
+template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
+          typename Params, int MIN_BLOCKS>
+__global__ __launch_bounds__(bdx * bdy * bdz, MIN_BLOCKS)
+void BatchDecodeWithPagedKVCacheKernel_KVF13(const __grid_constant__ Params params);
 
 template <uint32_t num_stages_smem, uint32_t vec_size_ckv, uint32_t vec_size_kpe, uint32_t bdx,
           uint32_t bdy, uint32_t bdz, uint32_t tile_size_qo_heads, typename AttentionVariant,
@@ -168,14 +175,21 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? ((!is_kvf13_sched && sizeof(DTypeKV) == 1) ? 2U : 4U) : 1U;
     const uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
     gdy = num_kv_heads;
-    constexpr size_t smem_elem_sz = is_kvf13_sched ? sizeof(__nv_bfloat16) : sizeof(DTypeKV);
+    constexpr uint32_t KV_STRIDE = is_kvf13_sched ? 208U : (HEAD_DIM * (uint32_t)sizeof(DTypeKV));
     const uint32_t smem_size =
-        2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * smem_elem_sz +
-        std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*), 2 * bdy * bdz * sizeof(float)) + (is_kvf13_sched ? 256 : 0);
+        2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * KV_STRIDE +
+        std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*), 2 * bdy * bdz * sizeof(float));
 
-    auto kernel =
-        BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
-                                          vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
+    auto kernel = [&]() {
+      if constexpr (is_kvf13_sched) {
+        return BatchDecodeWithPagedKVCacheKernel_KVF13<POS_ENCODING_MODE, NUM_STAGES_SMEM,
+            tile_size_per_bdx, vec_size, bdx, bdy, bdz, AttentionVariant, Params,
+            KVF13_LAUNCH_BOUNDS_MIN_BLOCKS>;
+      } else {
+        return BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM,
+            tile_size_per_bdx, vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
+      }
+    }();
     int num_blocks_per_sm = 0;
     int num_sm = 0;
     int dev_id = 0;
@@ -184,6 +198,11 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
                                                                        num_threads, smem_size));
     max_grid_size = num_blocks_per_sm * num_sm;
+    // KVFloat13: decode is compute-bound, benefits more from split-KV parallelism.
+    // Ensure split triggers at same threshold as BF16 by using BF16-equivalent grid capacity.
+    if constexpr (is_kvf13_sched) {
+      max_grid_size = std::max(max_grid_size, (uint32_t)(num_sm * 8));
+    }
     if (batch_size * gdy >= max_grid_size) {
       split_kv = false;
       max_num_pages_per_batch = 1;
