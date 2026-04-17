@@ -45,8 +45,7 @@ __constant__ uint8_t d_kvf13_lut[32] = {
 template <uint32_t vec_size>
 __device__ __forceinline__ void kvf13_load_decode_store(
     __nv_bfloat16* smem_dst,  // destination in shared memory
-    const uint8_t* kv_data,   // global packed cache
-    size_t base_offset,       // offset to start of this (page, entry, head) chunk (in bytes)
+    const uint8_t* chunk,     // pointer to start of 208-byte chunk
     uint32_t pos_in_head,     // position within head (tx * vec_size), 0-aligned
     bool pred                 // validity predicate
 ) {
@@ -58,8 +57,6 @@ __device__ __forceinline__ void kvf13_load_decode_store(
         }
         return;
     }
-
-    const uint8_t* chunk = kv_data + base_offset;
 
     // Load sign bits
     const uint8_t sign_byte = chunk[KVF13_SIGN_OFF + pos_in_head / 8];

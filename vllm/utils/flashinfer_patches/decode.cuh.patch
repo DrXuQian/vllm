@@ -100,3 +100,14 @@
 >             v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim + tx * vec_size,
 >             paged_kv.v_data + kv_offset[j], pred_v);
 >       }
+760c796,799
+<     constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
+---
+>     // KVFloat13 (DTypeKV=uint8_t): treat like BF16 for tile/smem sizing
+>     constexpr bool is_kvf13 = std::is_same_v<DTypeKV, uint8_t>;
+>     constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? ((!is_kvf13 && sizeof(DTypeKV) == 1) ? 2U : 4U) : 1U;
+>     constexpr size_t smem_elem_size = is_kvf13 ? sizeof(__nv_bfloat16) : sizeof(DTypeKV);
+763c802
+<           2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
+---
+>           2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * smem_elem_size +
