@@ -11,38 +11,28 @@
 
 namespace flashinfer {
 
-// smem stride per KV position: 208B for KVFloat13, head_dim*sizeof(T) for others
 template <typename DTypeKV, uint32_t HEAD_DIM>
 struct KVSmemStride {
     static constexpr uint32_t value = HEAD_DIM * sizeof(DTypeKV);
 };
 template <uint32_t HEAD_DIM>
 struct KVSmemStride<uint8_t, HEAD_DIM> {
-    static constexpr uint32_t value = KVF13_CHUNK_BYTES;  // 208
+    static constexpr uint32_t value = KVF13_CHUNK_BYTES;
 };
 
-// Decode vec_size(=8) values from a packed KVFloat13 chunk in smem.
-// 3 smem loads: sign(1B) + exp_hi(4B) + em(8B), no LUT, minimal ALU.
-//
-// Layout (208B per 128 values):
-//   [0..15]   signs:  128 bits = 16 bytes
-//   [16..79]  exp_hi: 128 nibbles = 64 bytes
-//   [80..207] em:     128 bytes (exp_lo1:1 + mant7:7)
 template <uint32_t vec_size>
 __device__ __forceinline__ void kvf13_decode_vec(
     vec_t<float, vec_size>& out,
-    const uint8_t* chunk,       // 208B packed chunk base in smem
-    uint32_t start_idx          // value index within head (0..127), must be multiple of 8
+    const uint8_t* chunk,
+    uint32_t start_idx
 ) {
     static_assert(vec_size == 8, "kvf13_decode_vec requires vec_size=8");
     const uint32_t tx = start_idx >> 3;
 
-    // --- 3 wide smem loads ---
-    const uint32_t sign_byte = chunk[tx];                                                   // lds.u8
-    const uint32_t exp_hi_w  = *reinterpret_cast<const uint32_t*>(chunk + 16 + tx * 4);     // lds.32
-    const uint2    em_pair   = *reinterpret_cast<const uint2*>(chunk + 80 + tx * 8);         // lds.64
+    const uint32_t sign_byte = chunk[tx];
+    const uint32_t exp_hi_w  = *reinterpret_cast<const uint32_t*>(chunk + 16 + tx * 4);
+    const uint2    em_pair   = *reinterpret_cast<const uint2*>(chunk + 80 + tx * 8);
 
-    // Paired decode: process 2 elements per iteration, branchless
     #pragma unroll
     for (uint32_t p = 0; p < 4; p++) {
         const uint32_t k0 = 2u * p;
@@ -64,16 +54,16 @@ __device__ __forceinline__ void kvf13_decode_vec(
         out[k0] = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&bf0));
         out[k1] = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&bf1));
     }
+
 }
 
-// cp_async load 208B packed chunk: 13 threads × 16B
 __device__ __forceinline__ void kvf13_cp_async_chunk(
     uint8_t* staging_smem,
     const uint8_t* global_chunk,
     uint32_t tx,
     bool valid
 ) {
-    constexpr uint32_t NUM_LOADS = KVF13_CHUNK_BYTES / 16;  // 13
+    constexpr uint32_t NUM_LOADS = KVF13_CHUNK_BYTES / 16;
     bool active = valid && (tx < NUM_LOADS);
     if (active) {
         uint32_t smem_addr = __cvta_generic_to_shared(staging_smem + tx * 16);
@@ -83,9 +73,7 @@ __device__ __forceinline__ void kvf13_cp_async_chunk(
     }
 }
 
-// Minimum blocks per SM for __launch_bounds__ on KVF13 decode kernel.
-// block_size=128 (bdx*bdy*bdz), MIN_BLOCKS=10 → max 51 regs/thread → ~25% more occupancy.
-static constexpr int KVF13_LAUNCH_BOUNDS_MIN_BLOCKS = 10;
+static constexpr int KVF13_LAUNCH_BOUNDS_MIN_BLOCKS = 1;
 
 }  // namespace flashinfer
 #endif
