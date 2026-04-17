@@ -446,6 +446,8 @@ class FIDecode:
     """Metadata for the native FlashInfer decode pathway (non-TRTLLM)."""
 
     wrapper: BatchDecodeWithPagedKVCacheWrapper
+    # Optional secondary wrapper for KVFloat13 native uint8 decode
+    kvf13_wrapper: BatchDecodeWithPagedKVCacheWrapper | None = None
 
 
 @dataclass
@@ -614,12 +616,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.head_dim = self.kv_cache_spec.head_size
         self.page_size = self.kv_cache_spec.block_size
 
-        if is_kvfloat13_kv_cache(self.cache_config.cache_dtype):
-            # KVFloat13: use BF16 for all plan() calls.
-            # Native uint8 decode kernel is verified correct but requires
-            # dual-wrapper approach (not yet implemented).
+        self._is_kvfloat13 = is_kvfloat13_kv_cache(self.cache_config.cache_dtype)
+        if self._is_kvfloat13:
+            # KVFloat13: prefill uses BF16 (shadow decode), decode uses uint8 (native).
+            # Two separate wrappers with different dtypes, never mixed.
             self.cache_dtype = self.cache_config.cache_dtype
-            self.kv_cache_dtype = self.model_config.dtype
+            self.kv_cache_dtype = self.model_config.dtype  # BF16 for prefill/cascade
+            self._kvfloat13_decode_dtype = torch.uint8  # uint8 for decode wrapper
         elif self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
             self.cache_dtype = self.cache_config.cache_dtype
             self.kv_cache_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
@@ -763,11 +766,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper
 
-    def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False):
+    def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False, suffix: str = ""):
+        cache_key = f"{batch_size}{suffix}" if use_cudagraph else suffix
         if use_cudagraph:
-            decode_wrapper = self._decode_wrappers_cudagraph.get(batch_size, None)
+            decode_wrapper = self._decode_wrappers_cudagraph.get(cache_key, None)
         else:
-            decode_wrapper = self._decode_wrapper
+            decode_wrapper = getattr(self, f'_decode_wrapper{suffix}', None)
 
         if decode_wrapper is None:
             if use_cudagraph:
@@ -778,6 +782,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 paged_kv_indptr = None
                 paged_kv_indices = None
                 paged_kv_last_page_len = None
+            # KVFloat13 native wrapper uses CUDA cores (not tensor cores)
+            # because our modified decode.cuh only handles the CUDA core path.
+            use_tc = True if suffix == "" else False
             decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 self._get_workspace_buffer(),
                 get_kv_cache_layout(),
@@ -785,17 +792,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 paged_kv_indptr_buffer=paged_kv_indptr,
                 paged_kv_indices_buffer=paged_kv_indices,
                 paged_kv_last_page_len_buffer=paged_kv_last_page_len,
-                # Tensor cores are enabled by default because the perf would be
-                # at least as good as cuda cores for all attention ops in latest
-                # gpus.
-                use_tensor_cores=True,
+                use_tensor_cores=use_tc,
             )
 
-            # save the decode wrapper
             if use_cudagraph:
-                self._decode_wrappers_cudagraph[batch_size] = decode_wrapper
+                self._decode_wrappers_cudagraph[cache_key] = decode_wrapper
             else:
-                self._decode_wrapper = decode_wrapper
+                setattr(self, f'_decode_wrapper{suffix}', decode_wrapper)
 
         return decode_wrapper
 
@@ -1198,7 +1201,35 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.disable_split_kv,
                 )
-                attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
+                # KVFloat13: also plan a uint8 wrapper for native decode
+                kvf13_wrapper = None
+                if self._is_kvfloat13:
+                    kvf13_wrapper = self._get_decode_wrapper(
+                        num_input_tokens, use_cudagraph,
+                        suffix="_kvf13",
+                    )
+                    fast_plan_decode(
+                        kvf13_wrapper,
+                        indptr_cpu=self.paged_kv_indptr.cpu[:num_input_tokens + 1],
+                        indices=paged_kv_indices,
+                        last_page_len_cpu=self.paged_kv_last_page_len.cpu[:num_input_tokens],
+                        num_qo_heads=self.num_qo_heads * self.dcp_world_size,
+                        num_kv_heads=self.num_kv_heads,
+                        head_dim=self.head_dim,
+                        page_size=self.page_size,
+                        pos_encoding_mode="NONE",
+                        sm_scale=self.sm_scale,
+                        window_left=self.window_left,
+                        logits_soft_cap=self.logits_soft_cap,
+                        q_data_type=self.q_data_type,
+                        kv_data_type=self._kvfloat13_decode_dtype,
+                        o_data_type=self.model_config.dtype,
+                        fixed_split_size=None,
+                    )
+                attn_metadata.decode = FIDecode(
+                    wrapper=decode_wrapper,
+                    kvf13_wrapper=kvf13_wrapper,
+                )
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
@@ -1456,10 +1487,12 @@ class FlashInferImpl(AttentionImpl):
             )
             kv_cache = kv_cache.view(torch_dtype)
 
-        # KVFloat13: decode to BF16 shadow for FlashInfer attention.
+        # KVFloat13: prefill uses shadow decode (BF16), decode uses native uint8.
         if self._is_kvfloat13:
             self._kvfloat13_packed_cache = kv_cache
-            kv_cache = self._decode_kvfloat13_to_shadow(kv_cache, attn_metadata)
+            if attn_metadata.num_prefill_tokens > 0:
+                kv_cache = self._decode_kvfloat13_to_shadow(kv_cache, attn_metadata)
+            # For pure decode: kv_cache stays as packed uint8, stride-tricked below
 
         # Inputs and outputs may be padded for CUDA graphs
         query = query[:num_actual_tokens]
@@ -1621,7 +1654,28 @@ class FlashInferImpl(AttentionImpl):
 
             if not decode_use_trtllm:
                 assert isinstance(attn_metadata.decode, FIDecode)
-                decode_wrapper = attn_metadata.decode.wrapper
+
+                # KVFloat13: use native uint8 wrapper if available
+                use_kvf13_native = (
+                    self._is_kvfloat13
+                    and attn_metadata.decode.kvf13_wrapper is not None
+                    and attn_metadata.num_prefill_tokens == 0
+                )
+                if use_kvf13_native:
+                    decode_wrapper = attn_metadata.decode.kvf13_wrapper
+                    # Create stride-trick uint8 view for native decode
+                    packed = self._kvfloat13_packed_cache
+                    decode_kv = torch.as_strided(
+                        packed,
+                        (packed.shape[0], 2, packed.shape[2], self.num_kv_heads, self.head_size),
+                        packed.stride()
+                    )
+                    stride_order = FlashInferBackend.get_kv_cache_stride_order()
+                    decode_kv_permute = decode_kv.permute(*stride_order)
+                else:
+                    decode_wrapper = attn_metadata.decode.wrapper
+                    decode_kv_permute = kv_cache_permute
+
                 assert decode_wrapper is not None
                 assert decode_wrapper._window_left == self.window_left
                 assert decode_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
@@ -1639,7 +1693,7 @@ class FlashInferImpl(AttentionImpl):
                     )
                     decode_wrapper.run(
                         decode_query,
-                        kv_cache_permute,
+                        decode_kv_permute,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=output_tmp,
@@ -1654,7 +1708,7 @@ class FlashInferImpl(AttentionImpl):
                 else:
                     decode_wrapper.run(
                         decode_query,
-                        kv_cache_permute,
+                        decode_kv_permute,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=output[:num_decode_tokens],
