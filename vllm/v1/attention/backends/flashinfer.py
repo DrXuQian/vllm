@@ -1301,34 +1301,13 @@ class FlashInferImpl(AttentionImpl):
         We decode ALL blocks (full decode). This is simple and correct.
         Future optimization: incremental decode (only changed blocks).
         """
-        # kv_cache shape from FlashInfer: [num_blocks, 2, block_size, num_kv_heads, packed_bytes]
+        # kv_cache: [num_blocks, 2, block_size, num_kv_heads, packed_bytes]
+        # Need to produce shadow: [num_blocks, 2, block_size, num_kv_heads, head_size] (BF16)
+        # Same layout as BF16 kv_cache — FlashInfer treats it identically.
         num_blocks = kv_cache.shape[0]
         block_size = kv_cache.shape[2]
 
-        # Find which blocks are actually in use from metadata
-        if hasattr(attn_metadata, 'decode') and attn_metadata.decode is not None:
-            block_table = getattr(attn_metadata.decode, 'block_tables', None)
-            if block_table is None:
-                # Try paged_kv wrapper
-                block_table = getattr(attn_metadata, 'block_table', None)
-        else:
-            block_table = getattr(attn_metadata, 'block_table', None)
-
-        if block_table is not None:
-            used_block_ids = torch.unique(block_table.view(-1))
-            # Remove padding (block_id=0 might be padding, but also valid)
-            used_block_ids = used_block_ids[used_block_ids < num_blocks]
-        else:
-            used_block_ids = torch.arange(
-                num_blocks, device=kv_cache.device, dtype=torch.int32
-            )
-
-        num_used = int(used_block_ids.numel())
-
-        # Transpose to [2, num_blocks, ...] for decode
-        kv_cache_t = kv_cache.permute(1, 0, 2, 3, 4)
-
-        # Allocate or reuse shadow (full size, only decode used blocks)
+        # Allocate or reuse shadow (same shape as BF16 cache)
         shadow = self._kvfloat13_shadow_cache
         expected_shape = (num_blocks, 2, block_size, self.num_kv_heads, self.head_size)
         if (
@@ -1343,16 +1322,20 @@ class FlashInferImpl(AttentionImpl):
             )
             self._kvfloat13_shadow_cache = shadow
 
-        # Decode only used blocks
-        decoded = decode_kvfloat13_blocks_triton(
-            kv_cache_t.contiguous(),
-            used_block_ids.to(torch.int32),
-            self.head_size,
-        )
-        # decoded: [2, num_used, block_size, num_kv_heads, head_size]
-        # Scatter into shadow at correct positions
-        shadow[used_block_ids] = decoded.permute(1, 0, 2, 3, 4)
+        # decode_kvfloat13_blocks_triton expects [2, num_blocks, block_size, num_kv_heads, packed]
+        # kv_cache is [num_blocks, 2, block_size, num_kv_heads, packed]
+        # Reshape: treat kv_cache[:, 0] as K-cache and kv_cache[:, 1] as V-cache
+        # Stack them as [2, num_blocks, ...] without copying
+        kv_for_decode = kv_cache.permute(1, 0, 2, 3, 4).contiguous()
 
+        # Find used blocks to avoid decoding empty ones
+        # Use all blocks for now (simple path) — shadow is pre-allocated
+        all_ids = torch.arange(num_blocks, device=kv_cache.device, dtype=torch.int32)
+        decoded = decode_kvfloat13_blocks_triton(kv_for_decode, all_ids, self.head_size)
+        # decoded: [2, num_blocks, block_size, num_kv_heads, head_size]
+
+        # Write to shadow in FlashInfer layout: [num_blocks, 2, ...]
+        shadow.copy_(decoded.permute(1, 0, 2, 3, 4))
         return shadow
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
@@ -1747,13 +1730,18 @@ class FlashInferImpl(AttentionImpl):
         slot_mapping: torch.Tensor,
     ) -> None:
         if self.kv_sharing_target_layer_name is None:
-            if is_kvfloat13_kv_cache(self.kv_cache_dtype):
+            if self._is_kvfloat13:
+                # reshape_and_cache_kvfloat13 expects [2, num_blocks, block_size, ...]
+                # FlashInfer cache is [num_blocks, 2, block_size, ...]
+                kv_cache_for_encode = kv_cache.permute(1, 0, 2, 3, 4).contiguous()
                 reshape_and_cache_kvfloat13(
                     key,
                     value,
-                    kv_cache,
+                    kv_cache_for_encode,
                     slot_mapping,
                 )
+                # Copy back (permute is a view, but contiguous() made a copy)
+                kv_cache.copy_(kv_cache_for_encode.permute(1, 0, 2, 3, 4))
             else:
                 torch.ops._C_cache_ops.reshape_and_cache_flash(
                     key,
