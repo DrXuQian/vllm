@@ -20,6 +20,11 @@ from flashinfer.utils import FP4Tensor
 from typing_extensions import override
 
 from vllm import envs
+from vllm.utils.kvfloat13 import (
+    is_kvfloat13_kv_cache,
+    reshape_and_cache_kvfloat13,
+    decode_kvfloat13_blocks_triton,
+)
 from vllm.config import (
     CUDAGraphMode,
     VllmConfig,
@@ -327,6 +332,7 @@ class FlashInferBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
+        "kfloat13",
     ]
 
     @staticmethod
@@ -355,6 +361,10 @@ class FlashInferBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        from vllm.utils.kvfloat13 import kvfloat13_packed_bytes_per_head
+        if is_kvfloat13_kv_cache(cache_dtype_str):
+            return (num_blocks, 2, block_size, num_kv_heads,
+                    kvfloat13_packed_bytes_per_head(head_size))
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -604,10 +614,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.head_dim = self.kv_cache_spec.head_size
         self.page_size = self.kv_cache_spec.block_size
 
-        if self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
+        if is_kvfloat13_kv_cache(self.cache_config.cache_dtype):
+            # KVFloat13: storage is uint8, but attention operates on BF16 shadow
             self.cache_dtype = self.cache_config.cache_dtype
-            # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
-            # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
+            self.kv_cache_dtype = self.model_config.dtype  # BF16 for attention
+        elif self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
+            self.cache_dtype = self.cache_config.cache_dtype
             self.kv_cache_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
                 self.cache_dtype
             )
@@ -1272,6 +1284,77 @@ class FlashInferImpl(AttentionImpl):
         else:
             self.dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
 
+        # KVFloat13 support
+        self._is_kvfloat13 = is_kvfloat13_kv_cache(kv_cache_dtype)
+        self._kvfloat13_shadow_cache: torch.Tensor | None = None
+
+    def _decode_kvfloat13_to_shadow(
+        self,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashInferMetadata,
+    ) -> torch.Tensor:
+        """Decode KVFloat13 packed cache → BF16 shadow cache for FlashInfer.
+
+        The shadow cache has the same shape as a standard BF16 paged KV cache:
+        [num_blocks, 2, block_size, num_kv_heads, head_size]
+
+        We decode ALL blocks (full decode). This is simple and correct.
+        Future optimization: incremental decode (only changed blocks).
+        """
+        # kv_cache shape from FlashInfer: [num_blocks, 2, block_size, num_kv_heads, packed_bytes]
+        num_blocks = kv_cache.shape[0]
+        block_size = kv_cache.shape[2]
+
+        # Find which blocks are actually in use from metadata
+        if hasattr(attn_metadata, 'decode') and attn_metadata.decode is not None:
+            block_table = getattr(attn_metadata.decode, 'block_tables', None)
+            if block_table is None:
+                # Try paged_kv wrapper
+                block_table = getattr(attn_metadata, 'block_table', None)
+        else:
+            block_table = getattr(attn_metadata, 'block_table', None)
+
+        if block_table is not None:
+            used_block_ids = torch.unique(block_table.view(-1))
+            # Remove padding (block_id=0 might be padding, but also valid)
+            used_block_ids = used_block_ids[used_block_ids < num_blocks]
+        else:
+            used_block_ids = torch.arange(
+                num_blocks, device=kv_cache.device, dtype=torch.int32
+            )
+
+        num_used = int(used_block_ids.numel())
+
+        # Transpose to [2, num_blocks, ...] for decode
+        kv_cache_t = kv_cache.permute(1, 0, 2, 3, 4)
+
+        # Allocate or reuse shadow (full size, only decode used blocks)
+        shadow = self._kvfloat13_shadow_cache
+        expected_shape = (num_blocks, 2, block_size, self.num_kv_heads, self.head_size)
+        if (
+            shadow is None
+            or shadow.device != kv_cache.device
+            or shadow.shape != expected_shape
+        ):
+            shadow = torch.empty(
+                expected_shape,
+                dtype=torch.bfloat16,
+                device=kv_cache.device,
+            )
+            self._kvfloat13_shadow_cache = shadow
+
+        # Decode only used blocks
+        decoded = decode_kvfloat13_blocks_triton(
+            kv_cache_t.contiguous(),
+            used_block_ids.to(torch.int32),
+            self.head_size,
+        )
+        # decoded: [2, num_used, block_size, num_kv_heads, head_size]
+        # Scatter into shadow at correct positions
+        shadow[used_block_ids] = decoded.permute(1, 0, 2, 3, 4)
+
+        return shadow
+
     def fused_output_quant_supported(self, quant_key: QuantKey):
         return (
             self.support_trtllm_attn
@@ -1386,6 +1469,10 @@ class FlashInferImpl(AttentionImpl):
                 self.kv_cache_dtype
             )
             kv_cache = kv_cache.view(torch_dtype)
+
+        # KVFloat13: decode packed cache → BF16 shadow cache for FlashInfer
+        if self._is_kvfloat13:
+            kv_cache = self._decode_kvfloat13_to_shadow(kv_cache, attn_metadata)
 
         # Inputs and outputs may be padded for CUDA graphs
         query = query[:num_actual_tokens]
@@ -1660,23 +1747,24 @@ class FlashInferImpl(AttentionImpl):
         slot_mapping: torch.Tensor,
     ) -> None:
         if self.kv_sharing_target_layer_name is None:
-            # Reshape the input keys and values and store them in the cache.
-            # Skip this if sharing KV cache with an earlier attention layer.
-            # NOTE(woosuk): Here, key and value are padded while slot_mapping is
-            # not padded. However, we don't need to do key[:num_actual_tokens]
-            # and value[:num_actual_tokens] because the reshape_and_cache_flash
-            # op uses the slot_mapping's shape to determine the number of
-            # actual tokens.
-            torch.ops._C_cache_ops.reshape_and_cache_flash(
-                key,
-                value,
-                kv_cache[:, 0],
-                kv_cache[:, 1],
-                slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-            )
+            if is_kvfloat13_kv_cache(self.kv_cache_dtype):
+                reshape_and_cache_kvfloat13(
+                    key,
+                    value,
+                    kv_cache,
+                    slot_mapping,
+                )
+            else:
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key,
+                    value,
+                    kv_cache[:, 0],
+                    kv_cache[:, 1],
+                    slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
 
 def fast_plan_decode(

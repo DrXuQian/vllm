@@ -319,9 +319,9 @@ class Attention(nn.Module, AttentionLayerBase):
             self.attn_backend = attn_backend
         if is_kvfloat13_kv_cache(kv_cache_dtype):
             assert self.attn_backend is not None
-            if self.attn_backend.get_name() != "FLASH_ATTN":
+            if self.attn_backend.get_name() not in ("FLASH_ATTN", "FLASHINFER"):
                 raise NotImplementedError(
-                    "KVFloat13 is only wired up for the FLASH_ATTN backend."
+                    "KVFloat13 is only wired up for FLASH_ATTN and FLASHINFER backends."
                 )
         backend_supports_alibi_sqrt = self.attn_backend.supports_alibi_sqrt()
         use_alibi_sqrt = use_alibi_sqrt if use_alibi_sqrt else False
