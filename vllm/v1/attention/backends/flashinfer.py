@@ -1453,8 +1453,11 @@ class FlashInferImpl(AttentionImpl):
             )
             kv_cache = kv_cache.view(torch_dtype)
 
-        # KVFloat13: decode packed cache → BF16 shadow cache for FlashInfer
+        # KVFloat13: save packed cache ref, then decode to shadow for prefill path
         if self._is_kvfloat13:
+            self._kvfloat13_packed_cache = kv_cache  # [num_blocks, 2, bs, heads, packed]
+            # For prefill path, still need shadow decode
+            # For decode path, fused kernel reads packed directly (skip shadow)
             kv_cache = self._decode_kvfloat13_to_shadow(kv_cache, attn_metadata)
 
         # Inputs and outputs may be padded for CUDA graphs
@@ -1615,7 +1618,25 @@ class FlashInferImpl(AttentionImpl):
             decode_query = query[:num_decode_tokens]
             assert decode_query.shape[0] == num_decode_tokens
 
-            if not decode_use_trtllm:
+            if self._is_kvfloat13 and isinstance(attn_metadata.decode, TRTLLMDecode):
+                # Fused KVFloat13 decode attention — reads packed KV
+                # directly from paged cache, no separate decode needed.
+                from vllm.utils.kvfloat13_fused_attn_loader import (
+                    kvfloat13_fused_decode_attn,
+                )
+                packed_cache = self._kvfloat13_packed_cache
+                kv_k = packed_cache[:, 0]  # [num_pages, page_size, heads, packed]
+                kv_v = packed_cache[:, 1]
+                fused_out = kvfloat13_fused_decode_attn(
+                    decode_query.contiguous().reshape(-1, self.num_heads, self.head_size),
+                    kv_k, kv_v,
+                    attn_metadata.decode.block_tables.to(torch.int32),
+                    attn_metadata.decode.seq_lens.to(torch.int32),
+                    self.scale,
+                )
+                output[:num_decode_tokens] = fused_out.reshape(num_decode_tokens, -1)
+
+            elif not decode_use_trtllm:
                 assert isinstance(attn_metadata.decode, FIDecode)
                 decode_wrapper = attn_metadata.decode.wrapper
                 assert decode_wrapper is not None
