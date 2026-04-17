@@ -262,9 +262,10 @@ extern "C" void kvfloat13_fused_decode_attention(
 
     uint32_t qo_heads_per_kv = num_qo_heads / num_kv_heads;
     uint32_t kv_chunk_size = 256;
-    // Use max_num_pages as a proxy for max_seq_len
-    // Caller should pass actual max_seq_len via max_num_pages parameter
-    uint32_t num_kv_chunks = (max_num_pages + kv_chunk_size - 1) / kv_chunk_size;
+    // max_num_pages = actual page_table columns
+    // max possible seq_len = max_num_pages * page_size
+    uint32_t max_possible_seq = max_num_pages * page_size;
+    uint32_t num_kv_chunks = (max_possible_seq + kv_chunk_size - 1) / kv_chunk_size;
     if (num_kv_chunks == 0) num_kv_chunks = 1;
 
     dim3 grid(num_kv_chunks, num_kv_heads, batch_size);

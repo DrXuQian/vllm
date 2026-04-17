@@ -52,8 +52,7 @@ torch::Tensor kvfloat13_fused_decode_attn(
     uint32_t head_dim = q.size(2);
     uint32_t num_kv_heads = kv_cache_k.size(2);
     uint32_t page_size = kv_cache_k.size(1);
-    // Pass max_seq_len as max_num_pages to control grid size
-    uint32_t max_kv_len = (uint32_t)max_seq_len;
+    uint32_t max_num_pages_actual = page_table.size(1);  // actual page_table columns
 
     auto output = torch::empty_like(q);
 
@@ -70,7 +69,7 @@ torch::Tensor kvfloat13_fused_decode_attn(
         num_kv_heads,
         head_dim,
         page_size,
-        max_kv_len,
+        max_num_pages_actual,  // correct page_table stride
         sm_scale,
         c10::cuda::getCurrentCUDAStream()
     );
