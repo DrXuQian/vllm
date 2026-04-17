@@ -615,12 +615,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.page_size = self.kv_cache_spec.block_size
 
         if is_kvfloat13_kv_cache(self.cache_config.cache_dtype):
-            # KVFloat13: use BF16 dtype for FlashInfer wrappers.
-            # The native uint8 decode path is activated at runtime via
-            # stride-trick views in forward(), not via plan() dtype.
-            # This ensures mixed prefill+decode batches work correctly.
+            # KVFloat13: use BF16 for all plan() calls.
+            # Native uint8 decode kernel is verified correct but requires
+            # dual-wrapper approach (not yet implemented).
             self.cache_dtype = self.cache_config.cache_dtype
-            self.kv_cache_dtype = self.model_config.dtype  # BF16 for all wrappers
+            self.kv_cache_dtype = self.model_config.dtype
         elif self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
             self.cache_dtype = self.cache_config.cache_dtype
             self.kv_cache_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
@@ -640,7 +639,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if (
             can_use_trtllm
             and not vllm_config.attention_config.disable_flashinfer_q_quantization
-            
+            and not self._is_kvfloat13
         ):
             self.q_data_type = self.kv_cache_dtype
         else:
@@ -1057,7 +1056,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 window_left=self.window_left,
                 logits_soft_cap=self.logits_soft_cap,
                 q_data_type=self.q_data_type,
-                kv_data_type=getattr(self, '_kvfloat13_prefill_kv_dtype', self.kv_cache_dtype),
+                kv_data_type=self.kv_cache_dtype,
             )
             return attn_metadata
 
@@ -1457,12 +1456,7 @@ class FlashInferImpl(AttentionImpl):
             )
             kv_cache = kv_cache.view(torch_dtype)
 
-        # KVFloat13: decode packed cache → BF16 shadow for FlashInfer.
-        # Shadow decode is needed because FlashInfer's Python wrapper
-        # requires plan() and run() to use the same kv_data_type,
-        # and mixed prefill+decode batches need a unified dtype.
-        # The native uint8 decode path (modified decode.cuh) works at
-        # the CUDA level but requires separate plan() for decode-only batches.
+        # KVFloat13: decode to BF16 shadow for FlashInfer attention.
         if self._is_kvfloat13:
             self._kvfloat13_packed_cache = kv_cache
             kv_cache = self._decode_kvfloat13_to_shadow(kv_cache, attn_metadata)
