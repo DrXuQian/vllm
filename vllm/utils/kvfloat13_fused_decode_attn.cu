@@ -1,26 +1,18 @@
 /**
- * KVFloat13 Fused Decode Attention Kernel
+ * KVFloat13 Fused Decode Attention Kernel (v2 — tile batching)
  *
- * Based on FlashInfer's BatchDecodeWithPagedKVCacheDevice structure,
- * but replaces cp_async K/V loads with in-register KVFloat13 decode.
+ * Reads packed KVFloat13 directly from paged KV cache,
+ * decodes to BF16 in registers, computes attention.
  *
- * Data flow per thread (vec_size=4):
- *   Global (7 bytes packed) → ldg → registers → decode → BF16 registers
- *   → sts to k_smem/v_smem → compute QK / accumulate V (unchanged)
- *
- * vs BF16 baseline:
- *   Global (8 bytes BF16) → cp_async → k_smem/v_smem → compute
- *
- * HBM savings: 208/256 = 18.75% less traffic per KV head.
+ * v2: Process TILE_SIZE KV positions per iteration for better
+ * instruction-level parallelism and reduced sync overhead.
  */
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 
-// ============================================================
-// KVFloat13 decompress LUT (32 entries, set at init)
-// ============================================================
+// KVFloat13 decompress LUT
 __constant__ uint8_t c_kvf13_decompress[32] = {
     0, 101, 102, 103, 104, 105, 106, 107,
     108, 109, 110, 111, 112, 113, 114, 115,
@@ -28,155 +20,80 @@ __constant__ uint8_t c_kvf13_decompress[32] = {
     124, 125, 126, 127, 128, 129, 130, 131
 };
 
-// KVFloat13 packed layout offsets within a 208-byte chunk (128 values)
-constexpr uint32_t KVF13_SIGN_OFF = 0;     // 16 bytes: 128 sign bits
-constexpr uint32_t KVF13_EXP_HI_OFF = 16;  // 64 bytes: 128 nibbles
-constexpr uint32_t KVF13_EM_OFF = 80;       // 128 bytes: [exp_lo|mant7]
+constexpr uint32_t KVF13_SIGN_OFF = 0;
+constexpr uint32_t KVF13_EXP_HI_OFF = 16;
+constexpr uint32_t KVF13_EM_OFF = 80;
 constexpr uint32_t KVF13_CHUNK_BYTES = 208;
-constexpr uint32_t KVF13_CHUNK_SIZE = 128;
 
 // ============================================================
-// In-register KVFloat13 decode: 7 bytes → 4 BF16 values
+// In-register KVFloat13 decode
 // ============================================================
 
-/**
- * Load packed KVFloat13 data from global memory and decode to BF16 in registers.
- *
- * @param packed_chunk  Pointer to the 208-byte chunk in global memory
- * @param pos           Position within the chunk (0..127), must be aligned to 4
- * @param out           Output array of 4 BF16 values
- */
-__device__ __forceinline__ void kvf13_decode_4_values(
-    const uint8_t* __restrict__ packed_chunk,
-    uint32_t pos,       // = tx * 4, aligned to 4
+__device__ __forceinline__ void kvf13_decode_4(
+    const uint8_t* __restrict__ chunk,
+    uint32_t pos,
     __nv_bfloat16 out[4]
 ) {
-    // Load sign bits: 1 byte covers 8 positions, we need 4 consecutive bits
-    const uint8_t sign_byte = packed_chunk[KVF13_SIGN_OFF + pos / 8];
-    const uint32_t sign_shift = pos & 7;  // pos % 8
-
-    // Load exp_hi nibbles: 2 bytes cover 4 positions
-    // Nibble packing: byte[i] has low_nibble=even, high_nibble=odd
-    const uint8_t eh0 = packed_chunk[KVF13_EXP_HI_OFF + pos / 2];
-    const uint8_t eh1 = packed_chunk[KVF13_EXP_HI_OFF + pos / 2 + 1];
-
-    // Load exp_lo_mant: 4 consecutive bytes (coalesced 32-bit load)
-    const uint32_t em4 = *reinterpret_cast<const uint32_t*>(
-        packed_chunk + KVF13_EM_OFF + pos);
+    const uint8_t sign_byte = chunk[KVF13_SIGN_OFF + pos / 8];
+    const uint32_t sign_shift = pos & 7;
+    const uint8_t eh0 = chunk[KVF13_EXP_HI_OFF + pos / 2];
+    const uint8_t eh1 = chunk[KVF13_EXP_HI_OFF + pos / 2 + 1];
+    const uint32_t em4 = *reinterpret_cast<const uint32_t*>(chunk + KVF13_EM_OFF + pos);
 
     #pragma unroll
     for (int i = 0; i < 4; i++) {
-        // Extract sign bit
         uint32_t sign = (sign_byte >> (sign_shift + i)) & 1u;
-
-        // Extract exp_hi nibble
-        uint32_t exp_h4;
-        if (i < 2) {
-            exp_h4 = (eh0 >> (i * 4)) & 0xFu;
-        } else {
-            exp_h4 = (eh1 >> ((i - 2) * 4)) & 0xFu;
-        }
-
-        // Extract em byte
+        uint32_t exp_h4 = (i < 2) ? ((eh0 >> (i * 4)) & 0xFu)
+                                   : ((eh1 >> ((i - 2) * 4)) & 0xFu);
         uint32_t em_b = (em4 >> (i * 8)) & 0xFFu;
-
-        // Reconstruct 5-bit exponent index
         uint32_t exp5 = (exp_h4 << 1) | (em_b >> 7);
-
-        // Decompress: exp5 → exp8 via constant memory LUT
         uint32_t exp8 = c_kvf13_decompress[exp5];
-
-        // Mantissa (7 bits, untouched)
         uint32_t mant7 = em_b & 0x7Fu;
-
-        // Assemble BF16: sign(1) | exp8(8) | mant7(7)
-        uint16_t bf16_bits = (uint16_t)((sign << 15) | (exp8 << 7) | mant7);
-        out[i] = *reinterpret_cast<__nv_bfloat16*>(&bf16_bits);
+        uint16_t bf16 = (uint16_t)((sign << 15) | (exp8 << 7) | mant7);
+        out[i] = *reinterpret_cast<__nv_bfloat16*>(&bf16);
     }
 }
 
-/**
- * Load and decode a tile of K or V values from paged KVFloat13 cache.
- *
- * Replaces cp_async in the original FlashInfer decode kernel.
- * Each thread loads its vec_size (=4) values from the packed page,
- * decodes in registers, and writes BF16 to shared memory.
- *
- * @param smem_dst      Destination in shared memory (BF16)
- * @param packed_cache  KV cache tensor base pointer (uint8)
- * @param kv_idx        KV position index (which token in the sequence)
- * @param kv_head_idx   KV head index
- * @param page_table    Block table for this request
- * @param page_size     Number of tokens per page
- * @param packed_stride_n   Stride in bytes between consecutive KV positions
- * @param packed_stride_h   Stride in bytes between consecutive KV heads
- * @param tx            Thread x index within warp (0..31)
- * @param valid         Whether this position is within sequence bounds
- */
-__device__ __forceinline__ void kvf13_load_tile_to_smem(
-    __nv_bfloat16* smem_dst,
-    const uint8_t* __restrict__ packed_cache,
+__device__ __forceinline__ void kvf13_load_to_smem(
+    __nv_bfloat16* dst,
+    const uint8_t* __restrict__ cache,
     uint32_t kv_idx,
     uint32_t kv_head_idx,
     const int32_t* page_table,
     uint32_t page_size,
-    uint32_t packed_stride_n,  // stride between tokens
-    uint32_t packed_stride_h,  // stride between heads
+    uint32_t stride_n,
+    uint32_t stride_h,
     uint32_t tx,
     bool valid
 ) {
     if (!valid) {
-        // Fill with zeros for out-of-bounds positions
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            smem_dst[tx * 4 + i] = __float2bfloat16(0.0f);
-        }
+        *reinterpret_cast<uint2*>(dst + tx * 4) = make_uint2(0, 0);
         return;
     }
-
-    // Resolve paged address
     uint32_t page_idx = kv_idx / page_size;
-    uint32_t page_offset = kv_idx % page_size;
-    int32_t physical_page = page_table[page_idx];
+    uint32_t page_off = kv_idx % page_size;
+    int32_t phys_page = page_table[page_idx];
+    const uint8_t* chunk = cache + (uint64_t)phys_page * page_size * stride_n
+                         + page_off * stride_n + kv_head_idx * stride_h;
 
-    // Calculate pointer to the 208-byte chunk for this (page, offset, head)
-    const uint8_t* chunk_ptr = packed_cache
-        + (uint64_t)physical_page * page_size * packed_stride_n
-        + page_offset * packed_stride_n
-        + kv_head_idx * packed_stride_h;
-
-    // Decode 4 values in registers
     __nv_bfloat16 decoded[4];
-    kvf13_decode_4_values(chunk_ptr, tx * 4, decoded);
-
-    // Write decoded BF16 to shared memory
-    *reinterpret_cast<uint2*>(smem_dst + tx * 4) =
-        *reinterpret_cast<uint2*>(decoded);
+    kvf13_decode_4(chunk, tx * 4, decoded);
+    *reinterpret_cast<uint2*>(dst + tx * 4) = *reinterpret_cast<uint2*>(decoded);
 }
 
-
 // ============================================================
-// Simplified paged decode attention kernel with fused KVFloat13
+// Tiled decode attention kernel
 // ============================================================
 
-/**
- * Batch decode attention with KVFloat13 paged KV cache.
- *
- * Each thread block handles one (batch, kv_head) pair.
- * Within each block, bdy query heads share the same KV head (GQA).
- *
- * Grid:  (num_kv_chunks, num_kv_heads, batch_size)
- * Block: (32, num_qo_heads_per_kv, 1)
- */
-template <uint32_t HEAD_DIM, uint32_t VEC_SIZE, uint32_t BDY>
+template <uint32_t HEAD_DIM, uint32_t VEC_SIZE, uint32_t BDY, uint32_t TILE_SIZE>
 __global__ void kvfloat13_batch_decode_attention_kernel(
-    const __nv_bfloat16* __restrict__ q,    // [batch, num_qo_heads, head_dim]
-    const uint8_t* __restrict__ kv_cache_k,  // [num_pages, page_size, num_kv_heads, packed_bytes]
-    const uint8_t* __restrict__ kv_cache_v,  // same layout
-    __nv_bfloat16* __restrict__ output,      // [batch, num_qo_heads, head_dim]
-    float* __restrict__ lse,                 // [batch, num_qo_heads] (optional)
-    const int32_t* __restrict__ page_table,  // [batch, max_num_pages]
-    const int32_t* __restrict__ seq_lens,    // [batch]
+    const __nv_bfloat16* __restrict__ q,
+    const uint8_t* __restrict__ kv_cache_k,
+    const uint8_t* __restrict__ kv_cache_v,
+    __nv_bfloat16* __restrict__ output,
+    float* __restrict__ lse,
+    const int32_t* __restrict__ page_table,
+    const int32_t* __restrict__ seq_lens,
     uint32_t num_qo_heads,
     uint32_t num_kv_heads,
     uint32_t page_size,
@@ -184,10 +101,10 @@ __global__ void kvfloat13_batch_decode_attention_kernel(
     float sm_scale,
     uint32_t kv_chunk_size
 ) {
-    constexpr uint32_t BDX = HEAD_DIM / VEC_SIZE;  // = 32 for head_dim=128, vec_size=4
+    constexpr uint32_t BDX = HEAD_DIM / VEC_SIZE;
 
     const uint32_t tx = threadIdx.x;
-    const uint32_t ty = threadIdx.y;  // which qo head within this kv head group
+    const uint32_t ty = threadIdx.y;
     const uint32_t kv_head_idx = blockIdx.y;
     const uint32_t batch_idx = blockIdx.z;
     const uint32_t kv_chunk_idx = blockIdx.x;
@@ -195,18 +112,15 @@ __global__ void kvfloat13_batch_decode_attention_kernel(
 
     const uint32_t seq_len = seq_lens[batch_idx];
     const int32_t* my_page_table = page_table + batch_idx * max_num_pages;
+    const uint32_t stride_h = KVF13_CHUNK_BYTES;
+    const uint32_t stride_n = num_kv_heads * KVF13_CHUNK_BYTES;
 
-    // Strides for packed KV cache
-    const uint32_t packed_bytes_per_head = KVF13_CHUNK_BYTES;  // 208
-    const uint32_t packed_stride_h = packed_bytes_per_head;
-    const uint32_t packed_stride_n = num_kv_heads * packed_bytes_per_head;
-
-    // Shared memory: k_smem and v_smem, each holds one tile of BF16 values
+    // Shared memory: TILE_SIZE rows of K, then TILE_SIZE rows of V
     extern __shared__ uint8_t smem_raw[];
     __nv_bfloat16* k_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-    __nv_bfloat16* v_smem = k_smem + BDY * HEAD_DIM;  // after K tile
+    __nv_bfloat16* v_smem = k_smem + TILE_SIZE * HEAD_DIM;
 
-    // Load query to registers
+    // Query in registers
     float q_reg[VEC_SIZE];
     #pragma unroll
     for (int i = 0; i < VEC_SIZE; i++) {
@@ -215,81 +129,107 @@ __global__ void kvfloat13_batch_decode_attention_kernel(
     }
 
     // Online softmax state
-    float m = -1e20f;   // running max
-    float d = 0.0f;     // running sum of exp
-    float o_reg[VEC_SIZE] = {0};  // running output accumulator
+    float m = -1e20f;
+    float d = 0.0f;
+    float o_reg[VEC_SIZE] = {0};
 
-    // Iterate over KV positions in this chunk
     uint32_t chunk_start = kv_chunk_idx * kv_chunk_size;
     uint32_t chunk_end = min(chunk_start + kv_chunk_size, seq_len);
 
-    for (uint32_t kv_pos = chunk_start; kv_pos < chunk_end; kv_pos++) {
-        // Load K for this position: packed → registers → BF16 → smem
-        bool valid = (kv_pos < seq_len);
-        kvf13_load_tile_to_smem(
-            k_smem + ty * HEAD_DIM,
-            kv_cache_k, kv_pos, kv_head_idx,
-            my_page_table, page_size,
-            packed_stride_n, packed_stride_h,
-            tx, valid
-        );
+    // Process TILE_SIZE positions per iteration
+    for (uint32_t tile_start = chunk_start; tile_start < chunk_end; tile_start += TILE_SIZE) {
+        uint32_t tile_end = min(tile_start + TILE_SIZE, chunk_end);
+        uint32_t tile_len = tile_end - tile_start;
+
+        // ---- Load K tile: TILE_SIZE positions ----
+        // Each thread loads its vec_size values for ONE position
+        // ty selects which position within the tile this thread handles
+        // We iterate if TILE_SIZE > BDY
+        #pragma unroll
+        for (uint32_t t = ty; t < TILE_SIZE; t += BDY) {
+            uint32_t kv_pos = tile_start + t;
+            bool valid = (kv_pos < chunk_end);
+            kvf13_load_to_smem(
+                k_smem + t * HEAD_DIM,
+                kv_cache_k, kv_pos, kv_head_idx,
+                my_page_table, page_size, stride_n, stride_h,
+                tx, valid
+            );
+        }
         __syncthreads();
 
-        // Compute QK dot product
-        float score = 0.0f;
+        // ---- Compute QK for all tile positions ----
+        float s[TILE_SIZE];
         #pragma unroll
-        for (int i = 0; i < VEC_SIZE; i++) {
-            score += q_reg[i] * __bfloat162float(k_smem[ty * HEAD_DIM + tx * VEC_SIZE + i]);
+        for (uint32_t t = 0; t < TILE_SIZE; t++) {
+            s[t] = 0.0f;
+            if (tile_start + t < chunk_end) {
+                #pragma unroll
+                for (int i = 0; i < VEC_SIZE; i++) {
+                    s[t] += q_reg[i] * __bfloat162float(k_smem[t * HEAD_DIM + tx * VEC_SIZE + i]);
+                }
+                // Warp reduction
+                #pragma unroll
+                for (uint32_t offset = BDX / 2; offset > 0; offset >>= 1) {
+                    s[t] += __shfl_xor_sync(0xFFFFFFFF, s[t], offset);
+                }
+                s[t] *= sm_scale;
+            } else {
+                s[t] = -1e20f;
+            }
         }
-        // Warp reduction
-        #pragma unroll
-        for (int offset = BDX / 2; offset > 0; offset >>= 1) {
-            score += __shfl_xor_sync(0xFFFFFFFF, score, offset);
-        }
-        score *= sm_scale;
-        if (!valid) score = -1e20f;
 
-        // Online softmax update
+        // ---- Online softmax update for entire tile ----
         float m_prev = m;
-        m = fmaxf(m, score);
-        float scale = expf(m_prev - m);
-        d = d * scale + expf(score - m);
-
-        // Scale previous output accumulator
+        #pragma unroll
+        for (uint32_t t = 0; t < TILE_SIZE; t++) {
+            m = fmaxf(m, s[t]);
+        }
+        float rescale = expf(m_prev - m);
+        d *= rescale;
         #pragma unroll
         for (int i = 0; i < VEC_SIZE; i++) {
-            o_reg[i] *= scale;
+            o_reg[i] *= rescale;
+        }
+        #pragma unroll
+        for (uint32_t t = 0; t < TILE_SIZE; t++) {
+            s[t] = expf(s[t] - m);
+            d += s[t];
         }
         __syncthreads();
 
-        // Load V for this position
-        kvf13_load_tile_to_smem(
-            v_smem + ty * HEAD_DIM,
-            kv_cache_v, kv_pos, kv_head_idx,
-            my_page_table, page_size,
-            packed_stride_n, packed_stride_h,
-            tx, valid
-        );
+        // ---- Load V tile ----
+        #pragma unroll
+        for (uint32_t t = ty; t < TILE_SIZE; t += BDY) {
+            uint32_t kv_pos = tile_start + t;
+            bool valid = (kv_pos < chunk_end);
+            kvf13_load_to_smem(
+                v_smem + t * HEAD_DIM,
+                kv_cache_v, kv_pos, kv_head_idx,
+                my_page_table, page_size, stride_n, stride_h,
+                tx, valid
+            );
+        }
         __syncthreads();
 
-        // Accumulate weighted V
-        float weight = expf(score - m);
+        // ---- Accumulate weighted V ----
         #pragma unroll
-        for (int i = 0; i < VEC_SIZE; i++) {
-            o_reg[i] += weight * __bfloat162float(v_smem[ty * HEAD_DIM + tx * VEC_SIZE + i]);
+        for (uint32_t t = 0; t < TILE_SIZE; t++) {
+            #pragma unroll
+            for (int i = 0; i < VEC_SIZE; i++) {
+                o_reg[i] += s[t] * __bfloat162float(v_smem[t * HEAD_DIM + tx * VEC_SIZE + i]);
+            }
         }
         __syncthreads();
     }
 
-    // Normalize output
+    // Normalize and write output
     float d_rcp = (d > 0.0f) ? 1.0f / d : 0.0f;
-    uint32_t out_offset = (batch_idx * num_qo_heads + qo_head_idx) * HEAD_DIM + tx * VEC_SIZE;
+    uint32_t out_off = (batch_idx * num_qo_heads + qo_head_idx) * HEAD_DIM + tx * VEC_SIZE;
     #pragma unroll
     for (int i = 0; i < VEC_SIZE; i++) {
-        output[out_offset + i] = __float2bfloat16(o_reg[i] * d_rcp);
+        output[out_off + i] = __float2bfloat16(o_reg[i] * d_rcp);
     }
-
-    // Store LSE
     if (lse != nullptr && tx == 0) {
         lse[batch_idx * num_qo_heads + qo_head_idx] = m + logf(d);
     }
@@ -317,17 +257,22 @@ extern "C" void kvfloat13_fused_decode_attention(
 ) {
     constexpr uint32_t HEAD_DIM = 128;
     constexpr uint32_t VEC_SIZE = 4;
-    constexpr uint32_t BDX = HEAD_DIM / VEC_SIZE;  // 32
+    constexpr uint32_t BDX = HEAD_DIM / VEC_SIZE;
+    constexpr uint32_t TILE_SIZE = 4;  // KV positions per tile
 
     uint32_t qo_heads_per_kv = num_qo_heads / num_kv_heads;
-    uint32_t kv_chunk_size = 64;  // tokens per chunk
-    uint32_t num_kv_chunks = (page_size * max_num_pages + kv_chunk_size - 1) / kv_chunk_size;
+    uint32_t kv_chunk_size = 256;
+    // Use max_num_pages as a proxy for max_seq_len
+    // Caller should pass actual max_seq_len via max_num_pages parameter
+    uint32_t num_kv_chunks = (max_num_pages + kv_chunk_size - 1) / kv_chunk_size;
+    if (num_kv_chunks == 0) num_kv_chunks = 1;
 
     dim3 grid(num_kv_chunks, num_kv_heads, batch_size);
     dim3 block(BDX, qo_heads_per_kv, 1);
-    uint32_t smem_size = 2 * qo_heads_per_kv * HEAD_DIM * sizeof(__nv_bfloat16);
+    // smem: TILE_SIZE rows of K + TILE_SIZE rows of V
+    uint32_t smem_size = 2 * TILE_SIZE * HEAD_DIM * sizeof(__nv_bfloat16);
 
-    kvfloat13_batch_decode_attention_kernel<HEAD_DIM, VEC_SIZE, 4>
+    kvfloat13_batch_decode_attention_kernel<HEAD_DIM, VEC_SIZE, 4, TILE_SIZE>
         <<<grid, block, smem_size, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q),
         reinterpret_cast<const uint8_t*>(kv_cache_k),

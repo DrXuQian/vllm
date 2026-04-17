@@ -1639,6 +1639,7 @@ class FlashInferImpl(AttentionImpl):
                     attn_metadata.decode.block_tables.to(torch.int32),
                     attn_metadata.decode.seq_lens.to(torch.int32),
                     self.scale,
+                    max_seq_len=attn_metadata.decode.max_seq_len,
                 )
                 output[:num_decode_tokens] = fused_out.reshape(num_decode_tokens, -1)
 
@@ -1758,17 +1759,12 @@ class FlashInferImpl(AttentionImpl):
     ) -> None:
         if self.kv_sharing_target_layer_name is None:
             if self._is_kvfloat13:
-                # reshape_and_cache_kvfloat13 expects [2, num_blocks, block_size, ...]
-                # FlashInfer cache is [num_blocks, 2, block_size, ...]
-                kv_cache_for_encode = kv_cache.permute(1, 0, 2, 3, 4).contiguous()
+                # Write K and V directly to FlashInfer layout [num_blocks, 2, ...]
+                # by constructing a [2, num_blocks, ...] VIEW (no copy) via stride tricks
+                kv_cache_transposed = kv_cache.transpose(0, 1)
                 reshape_and_cache_kvfloat13(
-                    key,
-                    value,
-                    kv_cache_for_encode,
-                    slot_mapping,
+                    key, value, kv_cache_transposed, slot_mapping,
                 )
-                # Copy back (permute is a view, but contiguous() made a copy)
-                kv_cache.copy_(kv_cache_for_encode.permute(1, 0, 2, 3, 4))
             else:
                 torch.ops._C_cache_ops.reshape_and_cache_flash(
                     key,

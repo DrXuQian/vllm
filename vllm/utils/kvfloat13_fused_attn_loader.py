@@ -41,7 +41,8 @@ torch::Tensor kvfloat13_fused_decode_attn(
     torch::Tensor kv_cache_v,   // same
     torch::Tensor page_table,   // [batch, max_num_pages]
     torch::Tensor seq_lens,     // [batch]
-    float sm_scale
+    float sm_scale,
+    int64_t max_seq_len        // actual max sequence length
 ) {
     TORCH_CHECK(q.is_cuda(), "q must be CUDA");
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be BF16");
@@ -51,7 +52,8 @@ torch::Tensor kvfloat13_fused_decode_attn(
     uint32_t head_dim = q.size(2);
     uint32_t num_kv_heads = kv_cache_k.size(2);
     uint32_t page_size = kv_cache_k.size(1);
-    uint32_t max_num_pages = page_table.size(1);
+    // Pass max_seq_len as max_num_pages to control grid size
+    uint32_t max_kv_len = (uint32_t)max_seq_len;
 
     auto output = torch::empty_like(q);
 
@@ -60,7 +62,7 @@ torch::Tensor kvfloat13_fused_decode_attn(
         kv_cache_k.data_ptr(),
         kv_cache_v.data_ptr(),
         output.data_ptr(),
-        nullptr,  // no lse for now
+        nullptr,
         page_table.data_ptr<int32_t>(),
         seq_lens.data_ptr<int32_t>(),
         batch_size,
@@ -68,7 +70,7 @@ torch::Tensor kvfloat13_fused_decode_attn(
         num_kv_heads,
         head_dim,
         page_size,
-        max_num_pages,
+        max_kv_len,
         sm_scale,
         c10::cuda::getCurrentCUDAStream()
     );
@@ -78,7 +80,10 @@ torch::Tensor kvfloat13_fused_decode_attn(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("kvfloat13_fused_decode_attn", &kvfloat13_fused_decode_attn,
-          "KVFloat13 fused decode attention");
+          "KVFloat13 fused decode attention",
+          py::arg("q"), py::arg("kv_cache_k"), py::arg("kv_cache_v"),
+          py::arg("page_table"), py::arg("seq_lens"),
+          py::arg("sm_scale"), py::arg("max_seq_len"));
 }
 """
 
@@ -113,6 +118,7 @@ def kvfloat13_fused_decode_attn(
     page_table: torch.Tensor,
     seq_lens: torch.Tensor,
     sm_scale: float,
+    max_seq_len: int = 0,
 ) -> torch.Tensor:
     """
     Fused KVFloat13 decode attention.
@@ -124,11 +130,14 @@ def kvfloat13_fused_decode_attn(
         page_table: [batch, max_num_pages] int32
         seq_lens: [batch] int32
         sm_scale: softmax scale (1/sqrt(head_dim))
+        max_seq_len: maximum sequence length (controls grid size)
 
     Returns:
         output: [batch, num_qo_heads, head_dim] BF16
     """
+    if max_seq_len <= 0:
+        max_seq_len = int(seq_lens.max().item())
     mod = ensure_kvfloat13_fused_attn_op()
     return mod.kvfloat13_fused_decode_attn(
-        q, kv_cache_k, kv_cache_v, page_table, seq_lens, sm_scale
+        q, kv_cache_k, kv_cache_v, page_table, seq_lens, sm_scale, max_seq_len
     )
