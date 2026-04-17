@@ -58,28 +58,30 @@ __device__ __forceinline__ void kvf13_load_decode_store(
         return;
     }
 
-    // Load sign bits
-    const uint8_t sign_byte = chunk[KVF13_SIGN_OFF + pos_in_head / 8];
-    const uint32_t sign_shift = pos_in_head & 7;
+    // Load sign bits: vec_size bits starting at pos_in_head
+    // For vec_size=8: exactly 1 byte. For vec_size=4: half a byte.
+    const uint32_t sign_byte_idx = pos_in_head / 8;
+    const uint32_t sign_bit_off = pos_in_head & 7;
 
-    // Load exp_hi nibbles (2 bytes for vec_size=4)
-    const uint8_t eh0 = chunk[KVF13_EXP_HI_OFF + pos_in_head / 2];
-    const uint8_t eh1 = chunk[KVF13_EXP_HI_OFF + pos_in_head / 2 + 1];
+    // Load exp_hi nibbles: vec_size/2 bytes
+    const uint32_t eh_byte_idx = pos_in_head / 2;
 
-    // Load exp_lo_mant (vec_size bytes, coalesced)
-    const uint32_t em4 = *reinterpret_cast<const uint32_t*>(
-        chunk + KVF13_EM_OFF + pos_in_head);
+    // Load exp_lo_mant: vec_size bytes
+    const uint32_t em_byte_idx = pos_in_head;
 
     #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
-        uint32_t sign = (sign_byte >> (sign_shift + i)) & 1u;
-        uint32_t exp_h4;
-        if (i < 2) {
-            exp_h4 = (eh0 >> (i * 4)) & 0xFu;
-        } else {
-            exp_h4 = (eh1 >> ((i - 2) * 4)) & 0xFu;
-        }
-        uint32_t em_b = (em4 >> (i * 8)) & 0xFFu;
+        // Sign: 1 bit
+        uint32_t sign = (chunk[KVF13_SIGN_OFF + (pos_in_head + i) / 8] >> ((pos_in_head + i) & 7)) & 1u;
+
+        // Exp_hi: 1 nibble (4 bits)
+        uint32_t eh_byte = chunk[KVF13_EXP_HI_OFF + (pos_in_head + i) / 2];
+        uint32_t exp_h4 = ((pos_in_head + i) & 1) ? ((eh_byte >> 4) & 0xFu) : (eh_byte & 0xFu);
+
+        // Exp_lo + mantissa: 1 byte
+        uint32_t em_b = chunk[KVF13_EM_OFF + pos_in_head + i];
+
+        // Reconstruct
         uint32_t exp5 = (exp_h4 << 1) | (em_b >> 7);
         uint32_t exp8 = d_kvf13_lut[exp5];
         uint32_t mant7 = em_b & 0x7Fu;
