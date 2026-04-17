@@ -1,0 +1,102 @@
+30a31
+> #include "decode_kvfloat13.cuh"
+406a408,413
+> 
+>   // KVFloat13 detection: DTypeKV is uint8_t but not FP8
+>   constexpr bool IS_KVFLOAT13 = std::is_same_v<DTypeKV, uint8_t>;
+>   // Shared memory stores decoded BF16 when KVFloat13, otherwise DTypeKV
+>   using SmemKVType = std::conditional_t<IS_KVFLOAT13, __nv_bfloat16, DTypeKV>;
+> 
+433,435c440,443
+<   DTypeKV* k_smem = (DTypeKV*)smem;
+<   DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
+<                                           sizeof(DTypeKV));
+---
+>   // For KVFloat13: smem holds decoded BF16, sized by SmemKVType=bfloat16
+>   SmemKVType* k_smem = (SmemKVType*)smem;
+>   SmemKVType* v_smem = (SmemKVType*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
+>                                           sizeof(SmemKVType));
+437c445
+<                                                 head_dim * sizeof(DTypeKV));
+---
+>                                                 head_dim * sizeof(SmemKVType));
+439c447
+<                                        sizeof(DTypeKV));
+---
+>                                        sizeof(SmemKVType));
+500,504c508,519
+<       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+<           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+<               tx * vec_size,
+<           paged_kv.k_data + kv_offset[j],
+<           ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
+---
+>       bool pred = ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size;
+>       if constexpr (IS_KVFLOAT13) {
+>         size_t chunk_base = kv_offset[j] - tx * vec_size;
+>         kvf13_load_decode_store<vec_size>(
+>             reinterpret_cast<__nv_bfloat16*>(k_smem) + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim + tx * vec_size,
+>             reinterpret_cast<const uint8_t*>(paged_kv.k_data) + chunk_base,
+>             tx * vec_size, pred);
+>       } else {
+>         cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+>             k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim + tx * vec_size,
+>             paged_kv.k_data + kv_offset[j], pred);
+>       }
+509,513c524,535
+<       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+<           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+<               tx * vec_size,
+<           paged_kv.v_data + kv_offset[j],
+<           ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
+---
+>       bool pred = ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size;
+>       if constexpr (IS_KVFLOAT13) {
+>         size_t chunk_base = kv_offset[j] - tx * vec_size;
+>         kvf13_load_decode_store<vec_size>(
+>             reinterpret_cast<__nv_bfloat16*>(v_smem) + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim + tx * vec_size,
+>             reinterpret_cast<const uint8_t*>(paged_kv.v_data) + chunk_base,
+>             tx * vec_size, pred);
+>       } else {
+>         cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+>             v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim + tx * vec_size,
+>             paged_kv.v_data + kv_offset[j], pred);
+>       }
+559,563c581,592
+<       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+<           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+<               tx * vec_size,
+<           paged_kv.k_data + kv_offset[j],
+<           (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
+---
+>       bool pred_k = (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size;
+>       if constexpr (IS_KVFLOAT13) {
+>         size_t chunk_base = kv_offset[j] - tx * vec_size;
+>         kvf13_load_decode_store<vec_size>(
+>             reinterpret_cast<__nv_bfloat16*>(k_smem) + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim + tx * vec_size,
+>             reinterpret_cast<const uint8_t*>(paged_kv.k_data) + chunk_base,
+>             tx * vec_size, pred_k);
+>       } else {
+>         cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+>             k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim + tx * vec_size,
+>             paged_kv.k_data + kv_offset[j], pred_k);
+>       }
+577,581c606,617
+<       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+<           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+<               tx * vec_size,
+<           paged_kv.v_data + kv_offset[j],
+<           (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
+---
+>       bool pred_v = (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size;
+>       if constexpr (IS_KVFLOAT13) {
+>         size_t chunk_base = kv_offset[j] - tx * vec_size;
+>         kvf13_load_decode_store<vec_size>(
+>             reinterpret_cast<__nv_bfloat16*>(v_smem) + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim + tx * vec_size,
+>             reinterpret_cast<const uint8_t*>(paged_kv.v_data) + chunk_base,
+>             tx * vec_size, pred_v);
+>       } else {
+>         cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+>             v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim + tx * vec_size,
+>             paged_kv.v_data + kv_offset[j], pred_v);
+>       }
