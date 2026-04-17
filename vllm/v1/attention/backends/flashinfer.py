@@ -1453,12 +1453,18 @@ class FlashInferImpl(AttentionImpl):
             )
             kv_cache = kv_cache.view(torch_dtype)
 
-        # KVFloat13: save packed cache ref, then decode to shadow for prefill path
+        # KVFloat13: save packed cache ref for fused decode kernel
         if self._is_kvfloat13:
-            self._kvfloat13_packed_cache = kv_cache  # [num_blocks, 2, bs, heads, packed]
-            # For prefill path, still need shadow decode
-            # For decode path, fused kernel reads packed directly (skip shadow)
-            kv_cache = self._decode_kvfloat13_to_shadow(kv_cache, attn_metadata)
+            self._kvfloat13_packed_cache = kv_cache
+            # Skip shadow decode when ONLY decode tokens exist AND fused
+            # kernel is available (TRTLLMDecode has block_tables/seq_lens).
+            # Prefill or FIDecode paths still need BF16 shadow.
+            need_shadow = (
+                attn_metadata.num_prefill_tokens > 0
+                or not isinstance(attn_metadata.decode, TRTLLMDecode)
+            )
+            if need_shadow:
+                kv_cache = self._decode_kvfloat13_to_shadow(kv_cache, attn_metadata)
 
         # Inputs and outputs may be padded for CUDA graphs
         query = query[:num_actual_tokens]
