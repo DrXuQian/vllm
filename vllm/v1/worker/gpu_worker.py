@@ -46,6 +46,7 @@ from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
+from vllm.utils.kvfloat13 import is_kvfloat13_kv_cache
 from vllm.utils.torch_utils import is_quantized_kv_cache, set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -64,6 +65,9 @@ from .gpu.warmup import warmup_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
+
+_FLASHINFER_BATCH_INVARIANT_WORKSPACE_BYTES = 2048 * 1024 * 1024
+_FLASHINFER_KVF13_RUNTIME_EXTRA_RESERVE_BYTES = 768 * 1024 * 1024
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -420,6 +424,17 @@ class Worker(WorkerBase):
             - cudagraph_memory_estimate_applied
         )
 
+        reserve_bytes = self._get_flashinfer_kvfloat13_runtime_reserve_bytes()
+        if reserve_bytes > 0:
+            self.available_kv_cache_memory_bytes = max(
+                self.available_kv_cache_memory_bytes - reserve_bytes,
+                0,
+            )
+            logger.info(
+                "Reserving %s GiB runtime headroom for FLASHINFER + kfloat13.",
+                format_gib(reserve_bytes),
+            )
+
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
             "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",
@@ -480,6 +495,49 @@ class Worker(WorkerBase):
                 )
 
         return int(self.available_kv_cache_memory_bytes)
+
+    def _get_flashinfer_kvfloat13_runtime_reserve_bytes(self) -> int:
+        attention_backend = getattr(self.vllm_config.attention_config, "backend", None)
+        backend_name = (
+            attention_backend.name
+            if hasattr(attention_backend, "name")
+            else str(attention_backend)
+        )
+        uses_flashinfer_kvfloat13 = (
+            backend_name.upper() == "FLASHINFER"
+            and is_kvfloat13_kv_cache(self.cache_config.cache_dtype)
+        )
+
+        if not uses_flashinfer_kvfloat13:
+            try:
+                attn_groups = getattr(self.model_runner, "attn_groups", None)
+                if attn_groups:
+                    uses_flashinfer_kvfloat13 = any(
+                        group.backend.get_name() == "FLASHINFER"
+                        and is_kvfloat13_kv_cache(
+                            group.kv_cache_spec.cache_dtype_str
+                        )
+                        for groups in attn_groups
+                        for group in groups
+                    )
+            except Exception:
+                uses_flashinfer_kvfloat13 = False
+
+        if not uses_flashinfer_kvfloat13:
+            return 0
+
+        compilation_config = getattr(self.vllm_config, "compilation_config", None)
+        max_capture_size = getattr(
+            compilation_config, "max_cudagraph_capture_size", 0
+        )
+        if max_capture_size > 1:
+            return 0
+
+        workspace_bytes = envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE
+        if envs.VLLM_BATCH_INVARIANT:
+            workspace_bytes = _FLASHINFER_BATCH_INVARIANT_WORKSPACE_BYTES
+
+        return workspace_bytes + _FLASHINFER_KVF13_RUNTIME_EXTRA_RESERVE_BYTES
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         """Get KV connector metadata from this worker if available."""

@@ -5222,6 +5222,7 @@ class GPUModelRunner(
         skip_eplb: bool = False,
         is_profile: bool = False,
         create_mixed_batch: bool = False,
+        mixed_batch_prefill_live: bool = False,
         remove_lora: bool = True,
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
@@ -5247,6 +5248,9 @@ class GPUModelRunner(
             is_profile: If True, this is a profile run.
             create_mixed_batch: If True, create a mixed batch with both decode
                 (1 token) and prefill (multiple tokens) requests.
+            mixed_batch_prefill_live: If True, the prefill request in the mixed
+                batch has no prior context. This is used to warm up native
+                FlashInfer ragged prefill paths for packed KV formats.
             remove_lora: If False, dummy LoRAs are not destroyed after the run
             num_active_loras: Number of distinct active LoRAs to capture for.
                 LoRA is activated when num_active_loras > 0.
@@ -5287,6 +5291,7 @@ class GPUModelRunner(
         max_num_reqs = self.scheduler_config.max_num_seqs
         if create_mixed_batch:
             assert not uniform_decode
+            assert not mixed_batch_prefill_live or create_mixed_batch
             # Create mixed batch:
             # first half decode tokens, second half one prefill
             num_decode_tokens = min(max_num_reqs - 1, num_tokens // 2)
@@ -5395,8 +5400,13 @@ class GPUModelRunner(
                     # In the mixed batch mode (used for FI warmup), we use
                     # shorter sequence lengths to run faster.
                     # TODO(luka) better system for describing dummy batches
+                    prefill_seq_len = (
+                        num_prefill_tokens
+                        if mixed_batch_prefill_live
+                        else num_prefill_tokens + 1
+                    )
                     seq_lens = torch.tensor(  # type: ignore[assignment]
-                        [1] * num_decode_tokens + [num_prefill_tokens + 1],
+                        [1] * num_decode_tokens + [prefill_seq_len],
                         dtype=torch.int,
                     )
                 else:

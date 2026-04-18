@@ -11,6 +11,41 @@
   - `kvfloat13` block decode
 - Correctness and microbench coverage exists in `tests/test_kvfloat13.py`.
 
+## Current Priority: FlashInfer Short-Context Fixes
+
+The active issue is no longer the low-level FlashInfer fused decode kernel. The
+single-kernel KVFloat13 decode path is already close to BF16. The blocker is the
+`FLASHINFER + kfloat13` integration path in vLLM:
+
+- `short-b1` has an abnormal memory failure under the same budget where BF16
+  succeeds.
+- `short-b4` is slower than BF16 even though the low-level fused kernel is
+  already near parity.
+- The next work must fix memory accounting / hidden allocations first.
+
+### Execution Order
+
+1. Reproduce and document `short-b1` and `short-b4` memory behavior for
+   `FLASHINFER + kfloat13`.
+2. Capture memory snapshots around:
+   - graph profiling
+   - FlashInfer wrapper planning
+   - warmup
+   - KV cache allocation
+3. Identify the concrete source of extra reserved memory on the `kfloat13`
+   path.
+4. Implement the smallest fix that removes the extra memory usage without
+   changing semantics.
+5. Re-run `short-b1` and `short-b4` end-to-end benchmarks.
+6. Only after memory behavior matches expectations, continue optimizing
+   `short-b4` throughput.
+
+### Guardrails
+
+- Do not accept fixes that increase permanent BF16 shadow memory.
+- Do not accept fixes that trade away the KV cache memory reduction.
+- Do not keep microbench-only improvements that fail end-to-end benchmarks.
+
 ## Near-Term Goals
 
 1. Stabilize single-request graph performance.
@@ -46,5 +81,6 @@ When optimizing, prefer this order:
 
 1. correctness
 2. graph-safe execution
-3. batched throughput
+3. memory behavior and KV budget correctness
+4. batched throughput
 4. new features

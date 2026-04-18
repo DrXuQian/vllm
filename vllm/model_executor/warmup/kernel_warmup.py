@@ -14,6 +14,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.platforms import current_platform
+from vllm.utils.kvfloat13 import is_kvfloat13_kv_cache
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer
 
@@ -54,6 +55,14 @@ def kernel_warmup(worker: "Worker"):
         except NotImplementedError:
             return False
 
+    def _uses_flashinfer_kvfloat13(model_runner: "GPUModelRunner") -> bool:
+        return any(
+            _is_flashinfer_backend(group.backend)
+            and is_kvfloat13_kv_cache(group.kv_cache_spec.cache_dtype_str)
+            for groups in model_runner.attn_groups
+            for group in groups
+        )
+
     if (
         not worker.model_runner.is_pooling_model
         and worker.model_runner.attn_groups
@@ -67,6 +76,9 @@ def kernel_warmup(worker: "Worker"):
         )
     ):
         logger.info("Warming up FlashInfer attention.")
+        mixed_batch_prefill_live = _uses_flashinfer_kvfloat13(
+            worker.model_runner
+        )
         # Warmup with mixed batch containing both prefill and decode tokens
         # This is to warm up both prefill and decode attention kernels
         worker.model_runner._dummy_run(
@@ -75,6 +87,7 @@ def kernel_warmup(worker: "Worker"):
             is_profile=True,
             force_attention=True,
             create_mixed_batch=True,
+            mixed_batch_prefill_live=mixed_batch_prefill_live,
         )
 
 

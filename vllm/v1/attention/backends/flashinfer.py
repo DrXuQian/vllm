@@ -439,6 +439,7 @@ class FIPrefill:
     """Metadata for the native FlashInfer prefill pathway (non-TRTLLM)."""
 
     wrapper: BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper
+    kvf13_ragged_wrapper: BatchPrefillWithRaggedKVCacheWrapper | None = None
 
 
 @dataclass
@@ -554,6 +555,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self._prefill_wrapper: (
             BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
         ) = None  # Wrapper for prefill/append
+        self._kvfloat13_ragged_prefill_wrapper: (
+            BatchPrefillWithRaggedKVCacheWrapper | None
+        ) = None
         self._decode_wrapper = None  # Wrapper for decode (general shape)
 
         if envs.VLLM_BATCH_INVARIANT:
@@ -765,6 +769,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper
+
+    def _get_kvfloat13_ragged_prefill_wrapper(
+        self,
+    ) -> BatchPrefillWithRaggedKVCacheWrapper:
+        if self._kvfloat13_ragged_prefill_wrapper is None:
+            self._kvfloat13_ragged_prefill_wrapper = (
+                BatchPrefillWithRaggedKVCacheWrapper(
+                    self._get_workspace_buffer(),
+                    get_kv_cache_layout(),
+                )
+            )
+        return self._kvfloat13_ragged_prefill_wrapper
 
     def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False, suffix: str = ""):
         cache_key = f"{batch_size}{suffix}" if use_cudagraph else suffix
@@ -1072,8 +1088,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 qo_indptr_cpu[prefill_start:] - qo_indptr_cpu[prefill_start]
             )
             assert qo_indptr_prefill_cpu.shape[0] == num_prefills + 1
+            query_lens_prefill_cpu = (
+                qo_indptr_prefill_cpu[1:] - qo_indptr_prefill_cpu[:-1]
+            )
+            force_kvf13_live_prefill = False
+            if self._is_kvfloat13 and not self.use_dcp:
+                assert seq_lens_cpu is not None
+                seq_lens_prefill_cpu = seq_lens_cpu[prefill_start:num_reqs]
+                force_kvf13_live_prefill = bool(
+                    torch.equal(query_lens_prefill_cpu, seq_lens_prefill_cpu)
+                )
 
-            if prefill_use_trtllm:
+            if prefill_use_trtllm and not force_kvf13_live_prefill:
                 # Create GPU versions
                 qo_indptr_prefill_gpu = (
                     qo_indptr[prefill_start:] - qo_indptr[prefill_start]
@@ -1096,6 +1122,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
             else:
                 prefill_wrapper = self._get_prefill_wrapper()
+                kvf13_ragged_wrapper = None
                 # Slicing CPU buffers that are only needed for FI native prefills
                 paged_kv_last_page_len_prefill_cpu = self.paged_kv_last_page_len.cpu[
                     prefill_start:num_reqs
@@ -1149,7 +1176,27 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
-                attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
+                if force_kvf13_live_prefill:
+                    kvf13_ragged_wrapper = (
+                        self._get_kvfloat13_ragged_prefill_wrapper()
+                    )
+                    kvf13_ragged_wrapper.plan(
+                        qo_indptr=qo_indptr_prefill_cpu,
+                        kv_indptr=qo_indptr_prefill_cpu,
+                        num_qo_heads=self.num_qo_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        head_dim_qk=self.head_dim,
+                        head_dim_vo=self.head_dim,
+                        causal=True,
+                        sm_scale=self.sm_scale,
+                        window_left=self.window_left,
+                        logits_soft_cap=self.logits_soft_cap,
+                        q_data_type=self.q_data_type,
+                    )
+                attn_metadata.prefill = FIPrefill(
+                    wrapper=prefill_wrapper,
+                    kvf13_ragged_wrapper=kvf13_ragged_wrapper,
+                )
 
         ## DECODE PATHWAY
         if num_decodes > 0:
@@ -1490,7 +1537,13 @@ class FlashInferImpl(AttentionImpl):
         # KVFloat13: prefill uses shadow decode (BF16), decode uses native uint8.
         if self._is_kvfloat13:
             self._kvfloat13_packed_cache = kv_cache
-            if attn_metadata.num_prefill_tokens > 0:
+            if (
+                attn_metadata.num_prefill_tokens > 0
+                and not (
+                    isinstance(attn_metadata.prefill, FIPrefill)
+                    and attn_metadata.prefill.kvf13_ragged_wrapper is not None
+                )
+            ):
                 kv_cache = self._decode_kvfloat13_to_shadow(kv_cache, attn_metadata)
             # For pure decode: kv_cache stays as packed uint8, stride-tricked below
 
@@ -1525,48 +1578,61 @@ class FlashInferImpl(AttentionImpl):
 
             if not prefill_use_trtllm:
                 assert isinstance(attn_metadata.prefill, FIPrefill)
-                prefill_wrapper = attn_metadata.prefill.wrapper
-                assert prefill_wrapper is not None
-                if use_dcp:
-                    assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
-                    assert prefill_wrapper._context._window_left == self.window_left
-                    assert prefill_wrapper._context._logits_soft_cap == (
-                        self.logits_soft_cap or 0.0
-                    )
-                    assert prefill_wrapper._context._sm_scale == self.scale
-                    assert not prefill_wrapper._context._causal
-                    assert prefill_wrapper._new_tokens._window_left == self.window_left
-                    assert prefill_wrapper._new_tokens._logits_soft_cap == (
-                        self.logits_soft_cap or 0.0
-                    )
-                    assert prefill_wrapper._new_tokens._sm_scale == self.scale
-                    assert prefill_wrapper._new_tokens._causal
-
-                    prefill_wrapper.run(
-                        layer,
+                if (
+                    self._is_kvfloat13
+                    and attn_metadata.prefill.kvf13_ragged_wrapper is not None
+                ):
+                    ragged_wrapper = attn_metadata.prefill.kvf13_ragged_wrapper
+                    assert ragged_wrapper is not None
+                    ragged_wrapper.run(
                         prefill_query,
-                        kv_cache_permute,
                         key[num_decode_tokens:],
                         value[num_decode_tokens:],
                         out=output[num_decode_tokens:],
                     )
                 else:
-                    assert isinstance(
-                        prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper
-                    )
-                    assert prefill_wrapper._window_left == self.window_left
-                    assert prefill_wrapper._logits_soft_cap == (
-                        self.logits_soft_cap or 0.0
-                    )
-                    assert prefill_wrapper._sm_scale == self.scale
-                    assert prefill_wrapper._causal
-                    prefill_wrapper.run(
-                        prefill_query,
-                        kv_cache_permute,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
-                        out=output[num_decode_tokens:],
-                    )
+                    prefill_wrapper = attn_metadata.prefill.wrapper
+                    assert prefill_wrapper is not None
+                    if use_dcp:
+                        assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
+                        assert prefill_wrapper._context._window_left == self.window_left
+                        assert prefill_wrapper._context._logits_soft_cap == (
+                            self.logits_soft_cap or 0.0
+                        )
+                        assert prefill_wrapper._context._sm_scale == self.scale
+                        assert not prefill_wrapper._context._causal
+                        assert prefill_wrapper._new_tokens._window_left == self.window_left
+                        assert prefill_wrapper._new_tokens._logits_soft_cap == (
+                            self.logits_soft_cap or 0.0
+                        )
+                        assert prefill_wrapper._new_tokens._sm_scale == self.scale
+                        assert prefill_wrapper._new_tokens._causal
+
+                        prefill_wrapper.run(
+                            layer,
+                            prefill_query,
+                            kv_cache_permute,
+                            key[num_decode_tokens:],
+                            value[num_decode_tokens:],
+                            out=output[num_decode_tokens:],
+                        )
+                    else:
+                        assert isinstance(
+                            prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper
+                        )
+                        assert prefill_wrapper._window_left == self.window_left
+                        assert prefill_wrapper._logits_soft_cap == (
+                            self.logits_soft_cap or 0.0
+                        )
+                        assert prefill_wrapper._sm_scale == self.scale
+                        assert prefill_wrapper._causal
+                        prefill_wrapper.run(
+                            prefill_query,
+                            kv_cache_permute,
+                            k_scale=layer._k_scale_float,
+                            v_scale=layer._v_scale_float,
+                            out=output[num_decode_tokens:],
+                        )
             else:
                 assert isinstance(attn_metadata.prefill, TRTLLMPrefill)
                 # prefill_query may be non-contiguous or have degenerate strides
@@ -1656,10 +1722,17 @@ class FlashInferImpl(AttentionImpl):
                 assert isinstance(attn_metadata.decode, FIDecode)
 
                 # KVFloat13: use native uint8 wrapper if available
+                packed_kv_retained = (
+                    attn_metadata.num_prefill_tokens == 0
+                    or (
+                        isinstance(attn_metadata.prefill, FIPrefill)
+                        and attn_metadata.prefill.kvf13_ragged_wrapper is not None
+                    )
+                )
                 use_kvf13_native = (
                     self._is_kvfloat13
                     and attn_metadata.decode.kvf13_wrapper is not None
-                    and attn_metadata.num_prefill_tokens == 0
+                    and packed_kv_retained
                 )
                 if use_kvf13_native:
                     decode_wrapper = attn_metadata.decode.kvf13_wrapper

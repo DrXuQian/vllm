@@ -59,21 +59,51 @@ expected include paths are:
 Validation summary
 ------------------
 
-Low-level FlashInfer kernel benchmark on the target case
-(`batch=4, seq=2048, qh=32, kh=8, head_dim=128, page_size=16`) with CUDA events:
+Kernel-only FlashInfer benchmark
+--------------------------------
 
-- BF16 mean: `18.915 us`
-- KVFloat13 mean: `18.689 us`
+Measured with the installed FlashInfer wrapper on one GPU using CUDA events,
+`use_tensor_cores=False`, `qh=32`, `kh=8`, `head_dim=128`, `page_size=16`.
+Numbers below are medians:
 
-End-to-end vLLM benchmark with `Qwen3-4B`, `FLASH_ATTN`, CUDA graph,
-`cudagraph_capture_sizes=[1,4]`:
+| batch | seq | BF16 | KVFloat13 | ratio |
+|---|---:|---:|---:|---:|
+| 1 | 256 | `29.344 us` | `29.744 us` | `1.01x` |
+| 1 | 2048 | `30.528 us` | `29.664 us` | `0.97x` |
+| 4 | 256 | `28.640 us` | `29.488 us` | `1.03x` |
+| 4 | 2048 | `29.776 us` | `35.424 us` | `1.19x` |
 
-- Short context, `batch=4`, actual prompt len about `241`
-  - BF16 steady-state: `250.71 tok/s`
-  - KVFloat13 steady-state: `245.04 tok/s`
-- Long context, `batch=4`, actual prompt len about `1871`
-  - BF16 steady-state: `86.22 tok/s`
-  - KVFloat13 steady-state: `83.93 tok/s`
+The main regression versus the original `2.7x` gap is gone; the remaining
+kernel-only gap is concentrated in the `batch=4, seq=2048` point.
 
-In both cases KVFloat13 still preserves about `+23%` KV capacity versus BF16 in
-the current vLLM pipeline.
+End-to-end vLLM FlashInfer benchmark
+------------------------------------
+
+Measured with `Qwen3-4B`, `attention_backend='FLASHINFER'`, CUDA graph enabled,
+and strictly serial one-case-per-process runs.
+
+Short context uses `prompt_len=256` (actual about `241` tokens).
+Long context uses `prompt_len=2048` (actual about `1871` tokens).
+
+| case | BF16 steady-state | KVFloat13 steady-state | ratio |
+|---|---:|---:|---:|
+| short-b1 | `91.86 tok/s` | `80.11 tok/s` | `0.87x` |
+| short-b4 | `256.49 tok/s` | `252.67 tok/s` | `0.98x` |
+| long-b1 | `52.12 tok/s` | `55.49 tok/s` | `1.06x` |
+| long-b4 | `86.83 tok/s` | `87.16 tok/s` | `1.00x` |
+
+Notes:
+
+- `short-b1` required a runtime headroom fix in vLLM so that `FLASHINFER +
+  kfloat13` no longer converts all saved memory into KV blocks and then OOMs
+  during warmup or benchmark.
+- `short-b4` is now effectively at BF16 parity in the FlashInfer-backed vLLM
+  path.
+- The remaining short-context deficit is concentrated in `batch=1`, not in the
+  batched path.
+
+KV cache capacity
+-----------------
+
+`kfloat13` still preserves about `+23%` KV capacity versus BF16 in the current
+vLLM pipeline.
