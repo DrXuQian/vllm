@@ -1,0 +1,524 @@
+--- a/flashinfer/data/include/flashinfer/attention/decode.cuh
++++ b/flashinfer/data/include/flashinfer/attention/decode.cuh
+@@ -28,6 +28,7 @@
+ #include "../pos_enc.cuh"
+ #include "../utils.cuh"
+ #include "../vec_dtypes.cuh"
++#include "decode_kvfloat13.cuh"
+ #include "cascade.cuh"
+ #include "state.cuh"
+ 
+@@ -76,7 +77,14 @@
+                                                   kv_idx_base + tz * tile_size + j);
+     } else {
+       // do not apply rotary embedding
+-      k_vec.cast_load(smem + (j * bdx + tx) * vec_size);
++      if constexpr (std::is_same_v<T, uint8_t>) {
++        // KVFloat13: decode from smem (exp_hi+em) + sign from register
++        constexpr uint32_t KV_STRIDE = KVSmemStride<T, bdx * vec_size>::value;
++        const uint8_t* chunk_j = reinterpret_cast<const uint8_t*>(smem) + j * KV_STRIDE;
++        kvf13_decode_vec<vec_size>(k_vec, chunk_j, tx * vec_size);
++      } else {
++        k_vec.cast_load(smem + (j * bdx + tx) * vec_size);
++      }
+     }
+     s[j] = 0.f;
+ #pragma unroll
+@@ -135,7 +143,13 @@
+ #pragma unroll
+   for (uint32_t j = 0; j < tile_size; ++j) {
+     vec_t<float, vec_size> v_vec;
+-    v_vec.cast_load(smem + (j * bdx + tx) * vec_size);
++    if constexpr (std::is_same_v<T, uint8_t>) {
++      constexpr uint32_t KV_STRIDE = KVSmemStride<T, bdx * vec_size>::value;
++      const uint8_t* chunk_j = reinterpret_cast<const uint8_t*>(smem) + j * KV_STRIDE;
++      kvf13_decode_vec<vec_size>(v_vec, chunk_j, tx * vec_size);
++    } else {
++      v_vec.cast_load(smem + (j * bdx + tx) * vec_size);
++    }
+ #pragma unroll
+     for (uint32_t i = 0; i < vec_size; ++i) {
+       st.o[i] = st.o[i] + s[j] * v_vec[i];
+@@ -393,12 +407,10 @@
+ template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
+           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
+           typename Params>
+-__device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& params, uint8_t smem[],
+-                                                             const uint32_t bx = blockIdx.x,
+-                                                             const uint32_t by = blockIdx.y,
+-                                                             const uint32_t tx = threadIdx.x,
+-                                                             const uint32_t ty = threadIdx.y,
+-                                                             const uint32_t tz = threadIdx.z) {
++__device__ __forceinline__ void BatchDecodeWithPagedKVCacheDevice(
++    const Params& params, uint8_t smem[], const uint32_t bx = blockIdx.x,
++    const uint32_t by = blockIdx.y, const uint32_t tx = threadIdx.x,
++    const uint32_t ty = threadIdx.y, const uint32_t tz = threadIdx.z) {
+   auto block = cg::this_thread_block();
+   using DTypeQ = typename Params::DTypeQ;
+   using DTypeKV = typename Params::DTypeKV;
+@@ -429,14 +441,23 @@
+       partition_kv ? min((kv_tile_idx + 1) * max_chunk_size, kv_len) : kv_len;
+   const uint32_t chunk_size = chunk_end - chunk_start;
+ 
++  constexpr bool IS_KVF13 = std::is_same_v<DTypeKV, uint8_t>;
++  constexpr uint32_t KV_STRIDE = KVSmemStride<DTypeKV, head_dim>::value;
++  constexpr uint32_t DECODED_STRIDE = head_dim * sizeof(__nv_bfloat16);
++  constexpr uint32_t RAW_STAGE_BYTES =
++      num_stages_smem * tile_size_per_bdx * bdy * bdz * KV_STRIDE;
++  constexpr uint32_t DECODED_STAGE_BYTES =
++      IS_KVF13 ? num_stages_smem * tile_size_per_bdx * bdy * bdz * DECODED_STRIDE : 0;
++  // KVFloat13: smem holds packed 208B chunks, not BF16 values
++  // BF16: smem holds head_dim × sizeof(BF16) = 256B per position
++
+   AttentionVariant variant(params, batch_idx, smem);
+   DTypeKV* k_smem = (DTypeKV*)smem;
+-  DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
+-                                          sizeof(DTypeKV));
+-  size_t* kv_offset_smem = (size_t*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz *
+-                                                head_dim * sizeof(DTypeKV));
+-  float* smem_md = (float*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
+-                                       sizeof(DTypeKV));
++  DTypeKV* v_smem = (DTypeKV*)(smem + RAW_STAGE_BYTES);
++  __nv_bfloat16* decoded_smem =
++      IS_KVF13 ? reinterpret_cast<__nv_bfloat16*>(smem + 2 * RAW_STAGE_BYTES) : nullptr;
++  size_t* kv_offset_smem = (size_t*)(smem + 2 * RAW_STAGE_BYTES + DECODED_STAGE_BYTES);
++  float* smem_md = (float*)(smem + 2 * RAW_STAGE_BYTES + DECODED_STAGE_BYTES);
+ 
+   vec_t<float, vec_size> q_vec;
+   vec_t<float, vec_size> freq;
+@@ -497,20 +518,37 @@
+     }
+ #pragma unroll
+     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+-          k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+-              tx * vec_size,
+-          paged_kv.k_data + kv_offset[j],
+-          ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
++      if constexpr (IS_KVF13) {
++        size_t base = kv_offset[j] - tx * vec_size;
++        bool kv_valid = ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size;
++        kvf13_cp_async_chunk(
++            smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * KV_STRIDE,
++            reinterpret_cast<const uint8_t*>(paged_kv.k_data) + base, tx, kv_valid);
++      } else {
++        cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
++            k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
++                tx * vec_size,
++            paged_kv.k_data + kv_offset[j],
++            ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
++      }
+     }
+     cp_async::commit_group();
+ #pragma unroll
+     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+-          v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+-              tx * vec_size,
+-          paged_kv.v_data + kv_offset[j],
+-          ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
++      if constexpr (IS_KVF13) {
++        size_t base = kv_offset[j] - tx * vec_size;
++        bool kv_valid = ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size;
++        kvf13_cp_async_chunk(
++            smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * KV_STRIDE +
++            (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * KV_STRIDE,
++            reinterpret_cast<const uint8_t*>(paged_kv.v_data) + base, tx, kv_valid);
++      } else {
++        cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
++            v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
++                tx * vec_size,
++            paged_kv.v_data + kv_offset[j],
++            ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
++      }
+     }
+     cp_async::commit_group();
+     stage_idx = (stage_idx + 1) % num_stages_smem;
+@@ -536,13 +574,29 @@
+     // compute qk
+     cp_async::wait_group<2 * num_stages_smem - 1>();
+     block.sync();
+-    compute_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx>(
+-        params, variant, batch_idx,
+-        k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, q_vec, freq,
+-        (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[batch_idx]) +
+-            chunk_start + iter * tile_size_per_bdx * bdy * bdz,
+-        iter * tile_size_per_bdx * bdy * bdz, chunk_size, qo_head_idx, kv_head_idx, s, st, tx, ty,
+-        tz);
++    if constexpr (IS_KVF13) {
++      kvf13_decode_tiles_to_bf16<vec_size, tile_size_per_bdx, bdy, head_dim>(
++          reinterpret_cast<const uint8_t*>(k_smem) +
++              (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * KV_STRIDE,
++          decoded_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, tx, ty);
++      block.sync();
++      compute_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx, AttentionVariant,
++                 Params, __nv_bfloat16>(
++          params, variant, batch_idx,
++          decoded_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, q_vec, freq,
++          (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[batch_idx]) +
++              chunk_start + iter * tile_size_per_bdx * bdy * bdz,
++          iter * tile_size_per_bdx * bdy * bdz, chunk_size, qo_head_idx, kv_head_idx, s, st, tx,
++          ty, tz);
++    } else {
++      compute_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx>(
++          params, variant, batch_idx,
++          k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, q_vec, freq,
++          (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[batch_idx]) +
++              chunk_start + iter * tile_size_per_bdx * bdy * bdz,
++          iter * tile_size_per_bdx * bdy * bdz, chunk_size, qo_head_idx, kv_head_idx, s, st, tx,
++          ty, tz);
++    }
+     block.sync();
+ 
+ #pragma unroll
+@@ -553,32 +607,61 @@
+                      tx * vec_size;
+     }
+ 
+-    // load k tiles
++    // load k tiles + sign ldg for next iteration
+ #pragma unroll
+     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+-          k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+-              tx * vec_size,
+-          paged_kv.k_data + kv_offset[j],
+-          (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
++      if constexpr (IS_KVF13) {
++        size_t base = kv_offset[j] - tx * vec_size;
++        bool kv_valid = (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size;
++        kvf13_cp_async_chunk(
++            smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * KV_STRIDE,
++            reinterpret_cast<const uint8_t*>(paged_kv.k_data) + base, tx, kv_valid);
++      } else {
++        cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
++            k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
++                tx * vec_size,
++            paged_kv.k_data + kv_offset[j],
++            (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
++      }
+     }
+     cp_async::commit_group();
+ 
+     // update m/d/o states
+     cp_async::wait_group<2 * num_stages_smem - 1>();
+     block.sync();
+-    update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
+-        v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx, st, tx);
++    if constexpr (IS_KVF13) {
++      kvf13_decode_tiles_to_bf16<vec_size, tile_size_per_bdx, bdy, head_dim>(
++          reinterpret_cast<const uint8_t*>(v_smem) +
++              (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * KV_STRIDE,
++          decoded_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, tx, ty);
++      block.sync();
++      update_local_state<vec_size, bdx, bdy * tile_size_per_bdx, __nv_bfloat16>(
++          decoded_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s,
++          stage_idx, st, tx);
++    } else {
++      update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
++          v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx, st,
++          tx);
++    }
+     block.sync();
+ 
+-    // load v tiles
++    // load v tiles + sign ldg for next iteration
+ #pragma unroll
+     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+-          v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+-              tx * vec_size,
+-          paged_kv.v_data + kv_offset[j],
+-          (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
++      if constexpr (IS_KVF13) {
++        size_t base = kv_offset[j] - tx * vec_size;
++        bool kv_valid = (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size;
++        kvf13_cp_async_chunk(
++            smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * KV_STRIDE +
++            (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * KV_STRIDE,
++            reinterpret_cast<const uint8_t*>(paged_kv.v_data) + base, tx, kv_valid);
++      } else {
++        cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
++            v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
++                tx * vec_size,
++            paged_kv.v_data + kv_offset[j],
++            (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
++      }
+     }
+     cp_async::commit_group();
+     stage_idx = (stage_idx + 1) % num_stages_smem;
+@@ -616,6 +699,16 @@
+                                     bdx, bdy, bdz, AttentionVariant>(params, smem);
+ }
+ 
++template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
++          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
++          typename Params, int MIN_BLOCKS>
++__global__ __launch_bounds__(bdx * bdy * bdz, MIN_BLOCKS)
++void BatchDecodeWithPagedKVCacheKernel_KVF13(const __grid_constant__ Params params) {
++  extern __shared__ uint8_t smem[];
++  BatchDecodeWithPagedKVCacheDevice<POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx, vec_size,
++                                    bdx, bdy, bdz, AttentionVariant>(params, smem);
++}
++
+ /*!
+  * \brief Get the heuristic number of threads per threadblock
+  * \param group_size The number of qo heads that maps to the same kv head in GQA.
+@@ -749,7 +842,10 @@
+   const uint32_t num_kv_heads = params.paged_kv.num_heads;
+   const uint32_t padded_batch_size = params.padded_batch_size;
+ 
+-  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
++  constexpr bool is_kvf13_ = std::is_same_v<DTypeKV, uint8_t>;
++  constexpr size_t eff_sz_ = is_kvf13_ ? sizeof(__nv_bfloat16) : sizeof(DTypeKV);
++  constexpr uint32_t KV_STRIDE_ = KVSmemStride<DTypeKV, HEAD_DIM>::value;
++  constexpr uint32_t vec_size = std::max(16UL / eff_sz_, HEAD_DIM / 32UL);
+   auto compute_capacity = GetCudaComputeCapability();
+   constexpr uint32_t bdx = HEAD_DIM / vec_size;
+   static_assert(bdx <= 32);
+@@ -757,15 +853,27 @@
+     constexpr uint32_t bdy = GROUP_SIZE;
+     constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
+     constexpr uint32_t bdz = num_threads / (bdx * bdy);
+-    constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
++    constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? ((!is_kvf13_ && sizeof(DTypeKV) == 1) ? 2U : 4U) : 1U;
+     DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
++      constexpr uint32_t decoded_stage_bytes =
++          is_kvf13_ ? (NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM *
++                        sizeof(__nv_bfloat16))
++                    : 0U;
+       const uint32_t smem_size =
+-          2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
++          2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * KV_STRIDE_ +
++          decoded_stage_bytes +
+           std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*),
+                    2 * bdy * bdz * sizeof(float));
+-      auto kernel =
+-          BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
+-                                            vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
++      auto kernel = [&]() {
++        if constexpr (is_kvf13_) {
++          return BatchDecodeWithPagedKVCacheKernel_KVF13<POS_ENCODING_MODE, NUM_STAGES_SMEM,
++              tile_size_per_bdx, vec_size, bdx, bdy, bdz, AttentionVariant, Params,
++              KVF13_LAUNCH_BOUNDS_MIN_BLOCKS>;
++        } else {
++          return BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM,
++              tile_size_per_bdx, vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
++        }
++      }();
+       FLASHINFER_CUDA_CALL(
+           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+       dim3 nblks(padded_batch_size, num_kv_heads);
+--- a/flashinfer/data/include/flashinfer/attention/scheduler.cuh
++++ b/flashinfer/data/include/flashinfer/attention/scheduler.cuh
+@@ -29,6 +29,7 @@
+ #include "../exception.h"
+ #include "../pos_enc.cuh"
+ #include "../utils.cuh"
++#include "decode_kvfloat13.cuh"
+ #include "heap.h"
+ 
+ namespace flashinfer {
+@@ -38,6 +39,12 @@
+           typename Params>
+ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params params);
+ 
++template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
++          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
++          typename Params, int MIN_BLOCKS>
++__global__ __launch_bounds__(bdx * bdy * bdz, MIN_BLOCKS)
++void BatchDecodeWithPagedKVCacheKernel_KVF13(const __grid_constant__ Params params);
++
+ template <uint32_t num_stages_smem, uint32_t vec_size_ckv, uint32_t vec_size_kpe, uint32_t bdx,
+           uint32_t bdy, uint32_t bdz, uint32_t tile_size_qo_heads, typename AttentionVariant,
+           typename Params>
+@@ -154,7 +161,10 @@
+     bool enable_cuda_graph, cudaStream_t stream) {
+   using DTypeKV = typename Params::DTypeKV;
+   using IdType = typename Params::IdType;
+-  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
++  // KVFloat13: use BF16-equivalent sizing
++  constexpr bool is_kvf13_sched = std::is_same_v<DTypeKV, uint8_t>;
++  constexpr size_t eff_kv_size = is_kvf13_sched ? sizeof(__nv_bfloat16) : sizeof(DTypeKV);
++  constexpr uint32_t vec_size = std::max(16UL / eff_kv_size, HEAD_DIM / 32UL);
+   auto compute_capacity = GetCudaComputeCapability();
+   DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
+     constexpr uint32_t bdx = HEAD_DIM / vec_size;
+@@ -162,16 +172,24 @@
+     constexpr uint32_t bdy = GROUP_SIZE;
+     constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
+     constexpr uint32_t bdz = num_threads / (bdx * bdy);
+-    constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
++    constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? ((!is_kvf13_sched && sizeof(DTypeKV) == 1) ? 2U : 4U) : 1U;
+     const uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
+     gdy = num_kv_heads;
++    constexpr uint32_t KV_STRIDE = is_kvf13_sched ? 208U : (HEAD_DIM * (uint32_t)sizeof(DTypeKV));
+     const uint32_t smem_size =
+-        2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
++        2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * KV_STRIDE +
+         std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*), 2 * bdy * bdz * sizeof(float));
+ 
+-    auto kernel =
+-        BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
+-                                          vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
++    auto kernel = [&]() {
++      if constexpr (is_kvf13_sched) {
++        return BatchDecodeWithPagedKVCacheKernel_KVF13<POS_ENCODING_MODE, NUM_STAGES_SMEM,
++            tile_size_per_bdx, vec_size, bdx, bdy, bdz, AttentionVariant, Params,
++            KVF13_LAUNCH_BOUNDS_MIN_BLOCKS>;
++      } else {
++        return BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM,
++            tile_size_per_bdx, vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
++      }
++    }();
+     int num_blocks_per_sm = 0;
+     int num_sm = 0;
+     int dev_id = 0;
+@@ -180,6 +198,11 @@
+     FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
+                                                                        num_threads, smem_size));
+     max_grid_size = num_blocks_per_sm * num_sm;
++    // KVFloat13: decode is compute-bound, benefits more from split-KV parallelism.
++    // Ensure split triggers at same threshold as BF16 by using BF16-equivalent grid capacity.
++    if constexpr (is_kvf13_sched) {
++      max_grid_size = std::max(max_grid_size, (uint32_t)(num_sm * 8));
++    }
+     if (batch_size * gdy >= max_grid_size) {
+       split_kv = false;
+       max_num_pages_per_batch = 1;
+--- a/flashinfer/data/include/flashinfer/attention/decode_kvfloat13.cuh
++++ b/flashinfer/data/include/flashinfer/attention/decode_kvfloat13.cuh
+@@ -0,0 +1,133 @@
++#ifndef FLASHINFER_DECODE_KVFLOAT13_CUH_
++#define FLASHINFER_DECODE_KVFLOAT13_CUH_
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++#define KVF13_SIGN_OFF   0
++#define KVF13_EXP_HI_OFF 16
++#define KVF13_EM_OFF     80
++#define KVF13_CHUNK_BYTES 208
++
++namespace flashinfer {
++
++template <typename DTypeKV, uint32_t HEAD_DIM>
++struct KVSmemStride {
++    static constexpr uint32_t value = HEAD_DIM * sizeof(DTypeKV);
++};
++template <uint32_t HEAD_DIM>
++struct KVSmemStride<uint8_t, HEAD_DIM> {
++    static constexpr uint32_t value = KVF13_CHUNK_BYTES;
++};
++
++template <uint32_t vec_size>
++__device__ __forceinline__ void kvf13_decode_vec(
++    vec_t<float, vec_size>& out,
++    const uint8_t* chunk,
++    uint32_t start_idx
++) {
++    static_assert(vec_size == 8, "kvf13_decode_vec requires vec_size=8");
++    const uint32_t tx = start_idx >> 3;
++    const uint32_t sign_byte = chunk[tx];
++    const uint32_t exp_hi_w  = *reinterpret_cast<const uint32_t*>(chunk + 16 + tx * 4);
++    const uint2    em_pair   = *reinterpret_cast<const uint2*>(chunk + 80 + tx * 8);
++
++    #pragma unroll
++    for (uint32_t p = 0; p < 4; p++) {
++        const uint32_t k0 = 2u * p;
++        const uint32_t k1 = k0 + 1u;
++        const uint32_t s0 = (sign_byte >> k0) & 1u;
++        const uint32_t s1 = (sign_byte >> k1) & 1u;
++        const uint32_t eh_byte = (exp_hi_w >> (8u * p)) & 0xFFu;
++        const uint32_t n0 = eh_byte & 0xFu;
++        const uint32_t n1 = (eh_byte >> 4u) & 0xFu;
++        const uint32_t em_word = (p < 2) ? em_pair.x : em_pair.y;
++        const uint32_t em0 = (em_word >> (8u * (k0 & 3u))) & 0xFFu;
++        const uint32_t em1 = (em_word >> (8u * (k1 & 3u))) & 0xFFu;
++        const uint32_t nz0 = n0 | (em0 >> 7u);
++        const uint32_t nz1 = n1 | (em1 >> 7u);
++        const uint32_t lo0 = (n0 << 8u) + em0 + (12800u & -(nz0 != 0u));
++        const uint32_t lo1 = (n1 << 8u) + em1 + (12800u & -(nz1 != 0u));
++        uint16_t bf0 = static_cast<uint16_t>(lo0);
++        uint16_t bf1 = static_cast<uint16_t>(lo1);
++        bf0 |= static_cast<uint16_t>(s0 << 15u);
++        bf1 |= static_cast<uint16_t>(s1 << 15u);
++        out[k0] = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&bf0));
++        out[k1] = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&bf1));
++    }
++
++}
++
++template <uint32_t vec_size>
++__device__ __forceinline__ void kvf13_decode_vec_bf16(
++    __nv_bfloat16* out,
++    const uint8_t* chunk,
++    uint32_t start_idx
++) {
++    static_assert(vec_size == 8, "kvf13_decode_vec_bf16 requires vec_size=8");
++    const uint32_t tx = start_idx >> 3;
++    const uint32_t sign_byte = chunk[tx];
++    const uint32_t exp_hi_w  = *reinterpret_cast<const uint32_t*>(chunk + 16 + tx * 4);
++    const uint2    em_pair   = *reinterpret_cast<const uint2*>(chunk + 80 + tx * 8);
++
++    #pragma unroll
++    for (uint32_t p = 0; p < 4; ++p) {
++        const uint32_t k0 = 2u * p;
++        const uint32_t k1 = k0 + 1u;
++        const uint32_t s0 = (sign_byte >> k0) & 1u;
++        const uint32_t s1 = (sign_byte >> k1) & 1u;
++        const uint32_t eh_byte = (exp_hi_w >> (8u * p)) & 0xFFu;
++        const uint32_t n0 = eh_byte & 0xFu;
++        const uint32_t n1 = (eh_byte >> 4u) & 0xFu;
++        const uint32_t em_word = (p < 2) ? em_pair.x : em_pair.y;
++        const uint32_t em0 = (em_word >> (8u * (k0 & 3u))) & 0xFFu;
++        const uint32_t em1 = (em_word >> (8u * (k1 & 3u))) & 0xFFu;
++        const uint32_t nz0 = n0 | (em0 >> 7u);
++        const uint32_t nz1 = n1 | (em1 >> 7u);
++        const uint32_t lo0 = (n0 << 8u) + em0 + (12800u & -(nz0 != 0u));
++        const uint32_t lo1 = (n1 << 8u) + em1 + (12800u & -(nz1 != 0u));
++        const uint16_t bf0 = static_cast<uint16_t>((s0 << 15u) | lo0);
++        const uint16_t bf1 = static_cast<uint16_t>((s1 << 15u) | lo1);
++        out[k0] = *reinterpret_cast<const __nv_bfloat16*>(&bf0);
++        out[k1] = *reinterpret_cast<const __nv_bfloat16*>(&bf1);
++    }
++}
++
++template <uint32_t vec_size, uint32_t tile_size_per_bdx, uint32_t bdy, uint32_t head_dim>
++__device__ __forceinline__ void kvf13_decode_tiles_to_bf16(
++    const uint8_t* packed_smem,
++    __nv_bfloat16* decoded_smem,
++    uint32_t tx,
++    uint32_t ty
++) {
++    constexpr uint32_t tile_size = tile_size_per_bdx * bdy;
++    #pragma unroll
++    for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
++        const uint32_t tile_idx = ty * tile_size_per_bdx + j;
++        kvf13_decode_vec_bf16<vec_size>(
++            decoded_smem + tile_idx * head_dim + tx * vec_size,
++            packed_smem + tile_idx * KVF13_CHUNK_BYTES,
++            tx * vec_size);
++    }
++}
++
++__device__ __forceinline__ void kvf13_cp_async_chunk(
++    uint8_t* staging_smem,
++    const uint8_t* global_chunk,
++    uint32_t tx,
++    bool valid
++) {
++    constexpr uint32_t NUM_LOADS = KVF13_CHUNK_BYTES / 16;
++    bool active = valid && (tx < NUM_LOADS);
++    if (active) {
++        uint32_t smem_addr = __cvta_generic_to_shared(staging_smem + tx * 16);
++        const void* gmem_ptr = global_chunk + tx * 16;
++        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
++                     :: "r"(smem_addr), "l"(gmem_ptr));
++    }
++}
++
++static constexpr int KVF13_LAUNCH_BOUNDS_MIN_BLOCKS = 2;
++
++}  // namespace flashinfer
++#endif

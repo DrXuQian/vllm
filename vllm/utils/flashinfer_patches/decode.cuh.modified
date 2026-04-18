@@ -407,12 +407,10 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
           typename Params>
-__device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& params, uint8_t smem[],
-                                                             const uint32_t bx = blockIdx.x,
-                                                             const uint32_t by = blockIdx.y,
-                                                             const uint32_t tx = threadIdx.x,
-                                                             const uint32_t ty = threadIdx.y,
-                                                             const uint32_t tz = threadIdx.z) {
+__device__ __forceinline__ void BatchDecodeWithPagedKVCacheDevice(
+    const Params& params, uint8_t smem[], const uint32_t bx = blockIdx.x,
+    const uint32_t by = blockIdx.y, const uint32_t tx = threadIdx.x,
+    const uint32_t ty = threadIdx.y, const uint32_t tz = threadIdx.z) {
   auto block = cg::this_thread_block();
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
@@ -445,16 +443,21 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
 
   constexpr bool IS_KVF13 = std::is_same_v<DTypeKV, uint8_t>;
   constexpr uint32_t KV_STRIDE = KVSmemStride<DTypeKV, head_dim>::value;
+  constexpr uint32_t DECODED_STRIDE = head_dim * sizeof(__nv_bfloat16);
+  constexpr uint32_t RAW_STAGE_BYTES =
+      num_stages_smem * tile_size_per_bdx * bdy * bdz * KV_STRIDE;
+  constexpr uint32_t DECODED_STAGE_BYTES =
+      IS_KVF13 ? num_stages_smem * tile_size_per_bdx * bdy * bdz * DECODED_STRIDE : 0;
   // KVFloat13: smem holds packed 208B chunks, not BF16 values
   // BF16: smem holds head_dim × sizeof(BF16) = 256B per position
 
   AttentionVariant variant(params, batch_idx, smem);
   DTypeKV* k_smem = (DTypeKV*)smem;
-  DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * KV_STRIDE);
-  size_t* kv_offset_smem = (size_t*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz *
-                                                KV_STRIDE);
-  float* smem_md = (float*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz *
-                                       KV_STRIDE);
+  DTypeKV* v_smem = (DTypeKV*)(smem + RAW_STAGE_BYTES);
+  __nv_bfloat16* decoded_smem =
+      IS_KVF13 ? reinterpret_cast<__nv_bfloat16*>(smem + 2 * RAW_STAGE_BYTES) : nullptr;
+  size_t* kv_offset_smem = (size_t*)(smem + 2 * RAW_STAGE_BYTES + DECODED_STAGE_BYTES);
+  float* smem_md = (float*)(smem + 2 * RAW_STAGE_BYTES + DECODED_STAGE_BYTES);
 
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
@@ -571,15 +574,29 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx>(
-        params, variant, batch_idx,
-        IS_KVF13 ? (DTypeKV*)(smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * KV_STRIDE)
-                 : k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim,
-        q_vec, freq,
-        (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[batch_idx]) +
-            chunk_start + iter * tile_size_per_bdx * bdy * bdz,
-        iter * tile_size_per_bdx * bdy * bdz, chunk_size, qo_head_idx, kv_head_idx, s, st, tx, ty,
-        tz);
+    if constexpr (IS_KVF13) {
+      kvf13_decode_tiles_to_bf16<vec_size, tile_size_per_bdx, bdy, head_dim>(
+          reinterpret_cast<const uint8_t*>(k_smem) +
+              (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * KV_STRIDE,
+          decoded_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, tx, ty);
+      block.sync();
+      compute_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx, AttentionVariant,
+                 Params, __nv_bfloat16>(
+          params, variant, batch_idx,
+          decoded_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, q_vec, freq,
+          (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[batch_idx]) +
+              chunk_start + iter * tile_size_per_bdx * bdy * bdz,
+          iter * tile_size_per_bdx * bdy * bdz, chunk_size, qo_head_idx, kv_head_idx, s, st, tx,
+          ty, tz);
+    } else {
+      compute_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx>(
+          params, variant, batch_idx,
+          k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, q_vec, freq,
+          (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[batch_idx]) +
+              chunk_start + iter * tile_size_per_bdx * bdy * bdz,
+          iter * tile_size_per_bdx * bdy * bdz, chunk_size, qo_head_idx, kv_head_idx, s, st, tx,
+          ty, tz);
+    }
     block.sync();
 
 #pragma unroll
@@ -612,11 +629,20 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     // update m/d/o states
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
-        IS_KVF13 ? (DTypeKV*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * KV_STRIDE +
-                    (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * KV_STRIDE)
-                 : v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim,
-        s, stage_idx, st, tx);
+    if constexpr (IS_KVF13) {
+      kvf13_decode_tiles_to_bf16<vec_size, tile_size_per_bdx, bdy, head_dim>(
+          reinterpret_cast<const uint8_t*>(v_smem) +
+              (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * KV_STRIDE,
+          decoded_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, tx, ty);
+      block.sync();
+      update_local_state<vec_size, bdx, bdy * tile_size_per_bdx, __nv_bfloat16>(
+          decoded_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s,
+          stage_idx, st, tx);
+    } else {
+      update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
+          v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx, st,
+          tx);
+    }
     block.sync();
 
     // load v tiles + sign ldg for next iteration
@@ -829,8 +855,13 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
     constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? ((!is_kvf13_ && sizeof(DTypeKV) == 1) ? 2U : 4U) : 1U;
     DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
+      constexpr uint32_t decoded_stage_bytes =
+          is_kvf13_ ? (NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM *
+                        sizeof(__nv_bfloat16))
+                    : 0U;
       const uint32_t smem_size =
           2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * KV_STRIDE_ +
+          decoded_stage_bytes +
           std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*),
                    2 * bdy * bdz * sizeof(float));
       auto kernel = [&]() {
