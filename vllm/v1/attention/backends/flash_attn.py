@@ -1581,10 +1581,6 @@ class FlashAttentionImpl(AttentionImpl):
         flat_block_ids = attn_metadata.block_table.reshape(-1)
 
         with _nvtx_range("fa.kvfloat13.graph_batched.decode"):
-            # Note: During CUDA graph capture/replay, we must use the
-            # full decode path (no data-dependent branching allowed).
-            # The graph_flat path is specifically for cudagraph mode,
-            # so always do full decode here.
             decode_kvfloat13_blocks_triton(
                 kv_cache,
                 flat_block_ids,
