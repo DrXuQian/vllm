@@ -731,6 +731,11 @@ class FlashAttentionImpl(AttentionImpl):
         self._kvfloat13_graph_block_idx_buf: torch.Tensor | None = None
         self._kvfloat13_graph_compact_slots: torch.Tensor | None = None
         self._kvfloat13_graph_prev_block_ids: torch.Tensor | None = None
+        # Separate graph-only shadow buffer (not shared with non-graph path).
+        self._kvfloat13_graph_shadow_kv: torch.Tensor | None = None
+        # Device-side scalar: actual number of valid rows for decode kernel.
+        # Updated before graph replay; kernel skips rows beyond this value.
+        self._kvfloat13_graph_actual_rows: torch.Tensor | None = None
 
     def _can_use_kvfloat13_single_request_fast_path(
         self,
@@ -1565,10 +1570,15 @@ class FlashAttentionImpl(AttentionImpl):
         block_size = kv_cache.shape[2]
         batch_size, max_blocks = attn_metadata.block_table.shape
         num_dense_blocks = batch_size * max_blocks
-        shadow_kv = self._get_kvfloat13_batched_shadow_buffer(
-            kv_cache,
-            num_dense_blocks,
-        )
+        # Dedicated graph shadow: must not be reallocated by the eager path.
+        expected_shape = (2, num_dense_blocks, block_size,
+                          self.num_kv_heads, self.head_size)
+        if (self._kvfloat13_graph_shadow_kv is None
+                or self._kvfloat13_graph_shadow_kv.shape != expected_shape
+                or self._kvfloat13_graph_shadow_kv.device != kv_cache.device):
+            self._kvfloat13_graph_shadow_kv = torch.empty(
+                expected_shape, dtype=torch.bfloat16, device=kv_cache.device)
+        shadow_kv = self._kvfloat13_graph_shadow_kv
         dense_block_table, base_slots = self._get_kvfloat13_graph_dense_block_table(
             attn_metadata.block_table,
             block_size,
@@ -1581,12 +1591,16 @@ class FlashAttentionImpl(AttentionImpl):
         flat_block_ids = attn_metadata.block_table.reshape(-1)
 
         with _nvtx_range("fa.kvfloat13.graph_batched.decode"):
-            decode_kvfloat13_blocks_triton(
-                kv_cache,
-                flat_block_ids,
-                self.head_size,
-                out=shadow_kv,
-            )
+            # Skip decode during CUDA graph capture — not recorded in graph.
+            # Shadow is populated during warmup (before capture) and after
+            # each prefill. Graph replay only does live_suffix_patch + attention.
+            if not torch.cuda.is_current_stream_capturing():
+                decode_kvfloat13_blocks_triton(
+                    kv_cache,
+                    flat_block_ids,
+                    self.head_size,
+                    out=shadow_kv,
+                )
 
         with _nvtx_range("fa.kvfloat13.graph_batched.live_suffix_patch"):
             flat_key_cache = shadow_kv[0].view(-1, self.num_kv_heads, self.head_size)
@@ -1837,6 +1851,18 @@ class FlashAttentionImpl(AttentionImpl):
                             value_cache,
                             layout_generation,
                         )
+
+                # Populate graph shadow buffer after prefill so decode graph
+                # replay has valid data. This runs in eager mode (not captured).
+                graph_shadow = self._kvfloat13_graph_shadow_kv
+                if graph_shadow is not None:
+                    flat_ids = attn_metadata.block_table.reshape(-1)
+                    if flat_ids.numel() == graph_shadow.shape[1]:
+                        with _nvtx_range("fa.kvfloat13.prefill_graph_shadow"):
+                            decode_kvfloat13_blocks_triton(
+                                kv_cache, flat_ids, self.head_size,
+                                out=graph_shadow,
+                            )
 
         cu_seqlens_q = attn_metadata.query_start_loc
         descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)

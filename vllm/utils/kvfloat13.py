@@ -696,6 +696,7 @@ def decode_kvfloat13_blocks_triton(
         kv_cache.stride(3),
         out_2d.stride(0),
         num_used_blocks,
+        actual_rows_tensor,
         NUM_HEADS=num_heads,
         BLOCK_SIZE=block_size,
         CHUNK_BYTES=KVFLOAT13_CHUNK_BYTES,
